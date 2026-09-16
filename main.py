@@ -51,15 +51,22 @@ import ocr_cropped_plates as ocr
 CONFIG = {
     # --- Source: set exactly ONE of these, leave the other as None ---
     "image": None,                                  # e.g. r"C:\cars\photo.jpg"
-    "folder": r"C:\Users\User\Documents\detection_pipeline\data",
+    "folder": r"data",
 
     # --- Models ---
-    "vehicle_weights": r"weights/vehicle_detector.pt",   # your trained vehicle .pt
-    "plate_weights": r"C:\Users\User\Documents\detection_pipeline\models\plate_yolov11n.95mAP\weights\platenum.pt",       # your trained plate .pt
+    "vehicle_weights": r"models\vehicle_yolov11n.94mAP\weights\vehicle.pt",   # your trained vehicle .pt
+    "plate_weights": r"models/plate_yolov11n.95mAP/weights/platenum.pt",       # your trained plate .pt
     "device": None,                                       # None = auto (GPU if available)
 
     # --- Vehicle detection stage ---
     "vehicle_classes": None,            # e.g. "car,truck,bus,motorcycle"; None = keep all classes
+    "vehicle_exclude_classes": "plate_number",  # e.g. class(es) baked into the vehicle model's
+                                         # training that you never want out of THIS stage (its
+                                         # built-in plate class, say) - dropped even if
+                                         # vehicle_classes is None. Comma-separated, exact match
+                                         # against the names your vehicle model reports (check
+                                         # vehicle_model.names to confirm spelling/case). None/""
+                                         # = don't drop anything extra.
     "vehicle_conf_threshold": 0.35,
     "vehicle_iou_threshold": 0.45,
     "vehicle_crop_padding": 0.20,       # extra margin around each vehicle box (20%) - "a little bit larger"
@@ -228,6 +235,10 @@ def process_single_image(
         set(c.strip() for c in args.vehicle_classes.split(",") if c.strip())
         if args.vehicle_classes else None
     )
+    vehicle_exclude_classes = (
+        set(c.strip() for c in args.vehicle_exclude_classes.split(",") if c.strip())
+        if args.vehicle_exclude_classes else None
+    )
 
     try:
         vehicle_preds = detect.run_local_detection(
@@ -237,6 +248,13 @@ def process_single_image(
     except (FileNotFoundError, detect.LocalInferenceError) as e:
         print(f"{filename} -> vehicle detection error: {e}")
         return 0
+
+    # Drop classes the vehicle model was trained on but that don't belong in
+    # THIS stage (its own built-in plate class, say) - done here rather than
+    # via --vehicle-classes so you don't have to enumerate every other class
+    # the model knows about just to exclude one.
+    if vehicle_exclude_classes:
+        vehicle_preds = [p for p in vehicle_preds if p.get("class") not in vehicle_exclude_classes]
 
     if not vehicle_preds:
         print(f"{filename} -> no vehicles detected")
@@ -369,6 +387,11 @@ def main():
     parser.add_argument("--vehicle-classes", default=CONFIG["vehicle_classes"],
                          help="Comma-separated vehicle class names to keep, e.g. 'car,truck,bus'. "
                               "Default: keep every class the vehicle model detects.")
+    parser.add_argument("--vehicle-exclude-classes", default=CONFIG["vehicle_exclude_classes"],
+                         help="Comma-separated class names to drop from the vehicle detection "
+                              "stage even though the vehicle model was trained to detect them "
+                              "(e.g. its own built-in 'plate_number' class). Applied after "
+                              "--vehicle-classes. Default: 'plate_number'.")
     parser.add_argument("--vehicle-conf-threshold", type=float, default=CONFIG["vehicle_conf_threshold"])
     parser.add_argument("--vehicle-iou-threshold", type=float, default=CONFIG["vehicle_iou_threshold"])
     parser.add_argument("--vehicle-crop-padding", type=float, default=CONFIG["vehicle_crop_padding"],
