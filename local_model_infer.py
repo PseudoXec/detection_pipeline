@@ -206,6 +206,8 @@ def crop_and_save_detections(
     prefix: str,
     padding_ratio: float = 0.15,
     min_crop_height: int = 120,
+    output_extension: str = ".jpg",
+    simple_name: bool = False,
 ) -> List[str]:
     """
     Crops each detected object out of image_path (using center x/y +
@@ -263,10 +265,17 @@ def crop_and_save_detections(
         conf = p.get("confidence")
         conf_str = f"{conf * 100:.0f}" if isinstance(conf, (int, float)) else "NA"
 
-        # Keep the full original filename, then tag "_cropped" plus the
-        # index/class/confidence - so any crop can be traced straight back
-        # to its source photo just by reading the name.
-        out_name = f"{prefix}_cropped_{i}_{safe_cls}_{conf_str}.jpg"
+        if simple_name:
+            base_name = f"{prefix}_crop" if i == 1 else f"{prefix}_crop_{i}"
+            out_name = f"{base_name}{output_extension}"
+            counter = 2
+            while os.path.exists(os.path.join(out_dir, out_name)):
+                out_name = f"{base_name}_{counter}{output_extension}"
+                counter += 1
+        else:
+            # Keep the full original filename, then tag the index/class/
+            # confidence so the crop can be traced back to its source.
+            out_name = f"{prefix}_cropped_{i}_{safe_cls}_{conf_str}{output_extension}"
         out_path = os.path.join(out_dir, out_name)
         cv2.imwrite(out_path, crop)
         saved_paths.append(out_path)

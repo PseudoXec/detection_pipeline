@@ -18,13 +18,12 @@ FOLDER LAYOUT (per run) - one flat folder per stage, per day
 --------------------------------------------------------------
 <out_dir>/<dd-mm-yy>/
     vehicle_detection/     <- every cropped vehicle from every image today
-        img1_vehicle1_car_92.jpg
-        img1_vehicle2_truck_87.jpg
-        img2_vehicle1_car_95.jpg
+        20260916_143012_125_car.png
+        20260916_143012_125_truck.png
     plate_detection/       <- every cropped plate from every vehicle today
-        img1_vehicle1_car_92_cropped_1_license_plate_88.jpg
+        20260916_143012_125_car_crop.png
     ocr/                   <- every OCR'd plate, renamed with its text
-        img1_vehicle1_car_92_cropped_1_license_plate_88_read_ABC1234.jpg
+        20260916_143012_125_car_ABC1234.png
     pipeline_log.csv       <- one row per plate result, ties it all together
 
 SETUP
@@ -52,11 +51,11 @@ import ocr_cropped_plates as ocr
 CONFIG = {
     # --- Source: set exactly ONE of these, leave the other as None ---
     "image": None,                                  # e.g. r"C:\cars\photo.jpg"
-    "folder": r"C:\Users\User\Documents\Detection_Inference\data\Batch1",
+    "folder": r"C:\Users\User\Documents\detection_pipeline\data",
 
     # --- Models ---
     "vehicle_weights": r"weights/vehicle_detector.pt",   # your trained vehicle .pt
-    "plate_weights": r"weights/plate_detector.pt",       # your trained plate .pt
+    "plate_weights": r"C:\Users\User\Documents\detection_pipeline\models\plate_yolov11n.95mAP\weights\platenum.pt",       # your trained plate .pt
     "device": None,                                       # None = auto (GPU if available)
 
     # --- Vehicle detection stage ---
@@ -105,6 +104,29 @@ def default_base_out_dir(image: Optional[str], folder: Optional[str]) -> str:
     else:
         sample_folder = os.path.abspath(os.path.dirname(image) or ".")
     return os.path.join(sample_folder, "vehicle_pipeline_output")
+
+
+def source_timestamp(image_path: str) -> str:
+    """Returns a filename-safe timestamp for a source image.
+
+    File inputs use their modification time. An RTSP capture should pass its
+    frame capture time instead when the live-feed adapter is added.
+    """
+    try:
+        captured_at = datetime.fromtimestamp(os.path.getmtime(image_path))
+    except OSError:
+        captured_at = datetime.now()
+    return captured_at.strftime("%Y%m%d_%H%M%S_%f")[:-3]
+
+
+def unique_stem(directory: str, stem: str, extension: str = ".png") -> str:
+    """Returns a non-colliding filename stem inside directory."""
+    candidate = stem
+    counter = 2
+    while os.path.exists(os.path.join(directory, f"{candidate}{extension}")):
+        candidate = f"{stem}_{counter}"
+        counter += 1
+    return candidate
 
 
 def crop_with_padding(
@@ -160,8 +182,9 @@ def run_ocr_on_plate_crops(
 
         plate_stem = os.path.splitext(os.path.basename(plate_path))[0]
         sanitized_text = ocr.sanitize_for_filename(text)
-        base_name = f"{plate_stem}_{status}_{sanitized_text}"
-        dest_path = ocr.unique_destination(ocr_dir, base_name, ".jpg")
+        vehicle_stem = plate_stem.removesuffix("_crop")
+        base_name = f"{vehicle_stem}_{sanitized_text}"
+        dest_path = ocr.unique_destination(ocr_dir, base_name, ".png")
         shutil.copy2(plate_path, dest_path)
 
         detail = text if text else "no text found"
@@ -225,15 +248,13 @@ def process_single_image(
         return 0
 
     print(f"{filename} -> {len(vehicle_preds)} vehicle(s) detected")
-    prefix = os.path.splitext(filename)[0]
+    timestamp = source_timestamp(image_path)
     vehicle_count = 0
 
     for i, pred in enumerate(vehicle_preds, start=1):
         cls = str(pred.get("class") or "vehicle")
         safe_cls = "".join(c if c.isalnum() else "_" for c in cls)
         v_conf = pred.get("confidence", 0.0)
-        v_conf_str = f"{v_conf * 100:.0f}" if isinstance(v_conf, (int, float)) else "NA"
-
         # Stage 1b: crop the vehicle with an enlarged bounding box.
         vehicle_crop = crop_with_padding(
             full_img, pred, args.vehicle_crop_padding, args.vehicle_crop_min_height,
@@ -244,8 +265,8 @@ def process_single_image(
         # All vehicle crops for the whole day land flat in vehicle_dir - the
         # filename itself (source image + vehicle index + class + conf) is
         # what keeps each one traceable, not a per-vehicle folder.
-        vehicle_name = f"{prefix}_vehicle{i}_{safe_cls}_{v_conf_str}"
-        vehicle_crop_path = os.path.join(vehicle_dir, f"{vehicle_name}.jpg")
+        vehicle_name = unique_stem(vehicle_dir, f"{timestamp}_{safe_cls}")
+        vehicle_crop_path = os.path.join(vehicle_dir, f"{vehicle_name}.png")
         cv2.imwrite(vehicle_crop_path, vehicle_crop)
         vehicle_count += 1
 
@@ -288,6 +309,7 @@ def process_single_image(
         plate_paths = detect.crop_and_save_detections(
             plate_input_path, plate_preds, plate_dir, vehicle_name,
             args.plate_crop_padding, args.plate_crop_min_height,
+            output_extension=".png", simple_name=True,
         )
         if not plate_paths:
             print(f"  {vehicle_name} -> plate found but not croppable")
