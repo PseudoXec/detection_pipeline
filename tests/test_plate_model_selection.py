@@ -79,6 +79,56 @@ class PlateModelSelectionTest(unittest.TestCase):
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
+    def test_rtsp_stream_skips_frames_and_releases_capture(self):
+        class FakeCapture:
+            def __init__(self):
+                self.frames = [
+                    (True, np.zeros((20, 20, 3), dtype=np.uint8)),
+                    (True, np.zeros((20, 20, 3), dtype=np.uint8)),
+                    (True, np.zeros((20, 20, 3), dtype=np.uint8)),
+                ]
+                self.read_count = 0
+                self.released = False
+
+            def isOpened(self):
+                return not self.released
+
+            def set(self, property_id, value):
+                return True
+
+            def read(self):
+                frame = self.frames[self.read_count]
+                self.read_count += 1
+                return frame
+
+            def release(self):
+                self.released = True
+
+        capture = FakeCapture()
+        args = argparse.Namespace(
+            stream_frame_skip=2,
+            stream_reconnect_delay=0,
+            stream_max_frames=2,
+        )
+        processed_paths = []
+
+        def fake_process_single_image(image_path, *unused_args):
+            processed_paths.append(image_path)
+            return 1
+
+        with patch.object(main.cv2, "imwrite", return_value=True), \
+             patch.object(main, "process_single_image", side_effect=fake_process_single_image):
+            total = main.process_rtsp_stream(
+                "rtsp://camera/stream", args, object(), object(), object(),
+                "out", "out/vehicle", "out/plate", "out/ocr", tempfile.gettempdir(), [],
+                capture_factory=lambda url: capture,
+            )
+
+        self.assertEqual(total, 2)
+        self.assertEqual(len(processed_paths), 2)
+        self.assertEqual(capture.read_count, 3)
+        self.assertTrue(capture.released)
+
 
 if __name__ == "__main__":
     unittest.main()

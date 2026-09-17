@@ -1,40 +1,10 @@
-"""
-main.py
--------
-Full raw-frame detection pipeline:
-
-    1. VEHICLE + PLATE DETECTION -> both logical passes run on the same raw
-                                    frame, independently of any crop.
-    2. PLATE ASSOCIATION         -> plate boxes are matched to vehicle boxes.
-    3. OCR + REVIEW OUTPUT       -> plates are cropped from the raw frame for
-                                    OCR; vehicle crops are thumbnails only.
-
-FOLDER LAYOUT (per run) - one flat folder per stage, per day
---------------------------------------------------------------
-<out_dir>/<dd-mm-yy>/
-    vehicle_detection/     <- every cropped vehicle from every image today
-        20260916_143012_125_car.png
-        20260916_143012_125_truck.png
-    plate_detection/       <- every cropped plate from every vehicle today
-        20260916_143012_125_car_crop.png
-    ocr/                   <- every OCR'd plate, renamed with its text
-        20260916_143012_125_car_ABC1234.png
-    pipeline_log.csv       <- one row per plate result, ties it all together
-
-SETUP
------
-    pip install ultralytics paddleocr paddlepaddle opencv-python numpy
-
-Requires local_model_infer.py and ocr_cropped_plates.py in the same folder
-(reused for detection, cropping and OCR - nothing is duplicated).
-"""
-
 import argparse
 import csv
 import os
 import shutil
 import sys
 import tempfile
+import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -47,7 +17,16 @@ import ocr_cropped_plates as ocr
 CONFIG = {
     # --- Source: set exactly ONE of these, leave the other as None ---
     "image": None,                                  # e.g. r"C:\cars\photo.jpg"
-    "folder": r"C:\Users\User\Documents\detection_pipeline\data",
+    "folder": None,                                 # e.g. r"C:\cars\sample_images"
+    "rtsp_url": r"rtsp://admin:Victoria2313*@192.168.100.229:554/stream1",                            # e.g. r"rtsp://user:password@camera/stream"
+    "stream_frame_skip": 20,                         # process one frame every N captured frames
+    "stream_width": 1280,                           # requested RTSP capture width
+    "stream_height": 720,                           # requested RTSP capture height
+    "stream_fps": 3,                               # requested RTSP capture FPS
+    "stream_buffer_size": 1,                        # keep only the newest buffered frame
+    "stream_reconnect_delay": 5.0,                  # seconds between reconnect attempts
+    "stream_max_frames": 5,                         # 0 = run until stopped; useful for testing
+    "stream_preview": True,                         # show live detection window for RTSP input
 
     # --- Models ---
     "vehicle_weights": r"C:\Users\User\Documents\detection_pipeline\models\vehicle.pt",   # your trained vehicle .pt
@@ -96,13 +75,15 @@ def make_date_dir(base_out_dir: str) -> str:
     return path
 
 
-def default_base_out_dir(image: Optional[str], folder: Optional[str]) -> str:
+def default_base_out_dir(image: Optional[str], folder: Optional[str], rtsp_url: Optional[str] = None) -> str:
     """Same convention as local_model_infer.default_out_dir: a sibling
     'vehicle_pipeline_output' folder next to the source."""
     if folder:
         sample_folder = os.path.abspath(folder.rstrip("/\\"))
-    else:
+    elif image:
         sample_folder = os.path.abspath(os.path.dirname(image) or ".")
+    else:
+        sample_folder = os.getcwd()
     return os.path.join(sample_folder, "vehicle_pipeline_output")
 
 
@@ -316,6 +297,28 @@ def crop_plate(
     return crop
 
 
+def draw_detection_preview(
+    frame: np.ndarray,
+    vehicle_predictions: List[Dict[str, Any]],
+    plate_predictions: List[Dict[str, Any]],
+) -> np.ndarray:
+    """Draw vehicle and plate boxes for the optional live RTSP preview."""
+    preview = np.array(frame, copy=True)
+    for prediction, color, label in [
+        *[(prediction, (0, 200, 0), "vehicle") for prediction in vehicle_predictions],
+        *[(prediction, (0, 165, 255), "plate") for prediction in plate_predictions],
+    ]:
+        x1, y1, x2, y2 = _box_edges(prediction)
+        top_left = (max(0, int(x1)), max(0, int(y1)))
+        bottom_right = (min(preview.shape[1] - 1, int(x2)), min(preview.shape[0] - 1, int(y2)))
+        confidence = prediction.get("confidence")
+        label_text = label if confidence is None else f"{label} {float(confidence):.2f}"
+        cv2.rectangle(preview, top_left, bottom_right, color, 2)
+        cv2.putText(preview, label_text, (top_left[0], max(18, top_left[1] - 6)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
+    return preview
+
+
 def draw_ocr_on_plate(
     plate_crop: np.ndarray,
     ocr_text: str,
@@ -479,6 +482,11 @@ def process_single_image(
     )
     print(f"{filename} -> {len(vehicle_preds)} vehicle(s), {len(plate_preds)} plate(s) detected")
 
+    saved_vehicle_crops = getattr(args, "_saved_vehicle_crops", {})
+    saved_plate_crops = getattr(args, "_saved_plate_crops", {})
+    args._saved_vehicle_crops = saved_vehicle_crops
+    args._saved_plate_crops = saved_plate_crops
+
     vehicle_rows: Dict[str, Dict[str, Any]] = {}
     vehicle_match_counts: Dict[str, int] = {}
     vehicle_count = 0
@@ -491,10 +499,13 @@ def process_single_image(
             full_img, pred, args.vehicle_crop_padding, args.vehicle_crop_min_height,
         )
         vehicle_crop_path = ""
-        if vehicle_crop is not None:
+        if track_id in saved_vehicle_crops:
+            vehicle_crop_path = saved_vehicle_crops[track_id]
+        elif vehicle_crop is not None:
             vehicle_name = unique_stem(vehicle_dir, f"{track_id}_{safe_cls}")
             vehicle_crop_path = os.path.join(vehicle_dir, f"{vehicle_name}.png")
             cv2.imwrite(vehicle_crop_path, vehicle_crop)
+            saved_vehicle_crops[track_id] = vehicle_crop_path
             vehicle_count += 1
         else:
             vehicle_name = track_id
@@ -514,6 +525,9 @@ def process_single_image(
     immediate_rows: List[Dict[str, Any]] = []
     for match in matches:
         track_id = match["track_id"]
+        if track_id is not None and track_id in saved_plate_crops:
+            print(f"  {track_id} -> plate crop already saved; skipping duplicate")
+            continue
         if track_id is None:
             base_row = {
                 "source_image": filename,
@@ -548,6 +562,9 @@ def process_single_image(
             })
             immediate_rows.append(row)
             continue
+
+        if track_id is not None:
+            saved_plate_crops[track_id] = plate_path
 
         plate_records.append({
             "base_row": base_row,
@@ -598,6 +615,12 @@ def process_single_image(
         })
         agg_rows.append(row)
 
+    if getattr(args, "show_stream_preview", False):
+        preview = draw_detection_preview(full_img, vehicle_preds, plate_preds)
+        cv2.imshow("RTSP detection preview", preview)
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            raise KeyboardInterrupt
+
     return vehicle_count
 
 
@@ -619,6 +642,85 @@ def write_aggregate_log(date_dir: str, agg_rows: List[Dict[str, Any]]) -> str:
     return output_path
 
 
+def process_rtsp_stream(
+    rtsp_url: str,
+    args: Any,
+    vehicle_model: Any,
+    plate_model: Any,
+    ocr_engine: Any,
+    date_dir: str,
+    vehicle_dir: str,
+    plate_dir: str,
+    ocr_dir: str,
+    work_dir: str,
+    agg_rows: List[Dict[str, Any]],
+    capture_factory: Any = cv2.VideoCapture,
+) -> int:
+    """Read an RTSP feed and send selected frames through the image pipeline."""
+    frame_skip = max(1, int(args.stream_frame_skip))
+    reconnect_delay = max(0.0, float(args.stream_reconnect_delay))
+    max_frames = max(0, int(args.stream_max_frames))
+    capture = None
+    frame_number = 0
+    processed_frames = 0
+    total_vehicles = 0
+
+    try:
+        while max_frames == 0 or processed_frames < max_frames:
+            if capture is None or not capture.isOpened():
+                if capture is not None:
+                    capture.release()
+                print(f"[stream] Connecting to {rtsp_url}")
+                capture = capture_factory(rtsp_url)
+                capture.set(cv2.CAP_PROP_FRAME_WIDTH, max(0, int(getattr(args, "stream_width", 1280))))
+                capture.set(cv2.CAP_PROP_FRAME_HEIGHT, max(0, int(getattr(args, "stream_height", 720))))
+                capture.set(cv2.CAP_PROP_FPS, max(0, int(getattr(args, "stream_fps", 15))))
+                capture.set(cv2.CAP_PROP_BUFFERSIZE, max(1, int(getattr(args, "stream_buffer_size", 1))))
+                if not capture.isOpened():
+                    print(f"[stream] Connection failed; retrying in {reconnect_delay:g}s")
+                    capture.release()
+                    capture = None
+                    if reconnect_delay:
+                        time.sleep(reconnect_delay)
+                    continue
+                print("[stream] Connected")
+
+            ok, frame = capture.read()
+            if not ok or frame is None:
+                print(f"[stream] Frame read failed; reconnecting in {reconnect_delay:g}s")
+                capture.release()
+                capture = None
+                if reconnect_delay:
+                    time.sleep(reconnect_delay)
+                continue
+
+            frame_number += 1
+            if (frame_number - 1) % frame_skip != 0:
+                continue
+
+            frame_name = datetime.now().strftime("stream_%Y%m%d_%H%M%S_%f.jpg")
+            frame_path = os.path.join(work_dir, frame_name)
+            if not cv2.imwrite(frame_path, frame):
+                print(f"[stream] Could not stage frame {frame_number}")
+                continue
+
+            total_vehicles += process_single_image(
+                frame_path, args, vehicle_model, plate_model, ocr_engine,
+                date_dir, vehicle_dir, plate_dir, ocr_dir, work_dir, agg_rows,
+            )
+            processed_frames += 1
+            print(f"[stream] Processed frame {processed_frames} (captured {frame_number})")
+    except KeyboardInterrupt:
+        print("\n[stream] Stopped by user")
+    finally:
+        if capture is not None:
+            capture.release()
+        if getattr(args, "show_stream_preview", False):
+            cv2.destroyAllWindows()
+
+    return total_vehicles
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Pipeline: raw-frame vehicle and plate detection -> matching -> OCR. "
@@ -626,8 +728,10 @@ def main():
     )
 
     source_group = parser.add_mutually_exclusive_group()
-    source_group.add_argument("--image", default=CONFIG["image"])
-    source_group.add_argument("--folder", default=CONFIG["folder"])
+    source_group.add_argument("--image")
+    source_group.add_argument("--folder")
+    source_group.add_argument("--rtsp-url",
+                              help="RTSP camera URL, e.g. rtsp://user:password@camera/stream")
 
     parser.add_argument("--vehicle-weights", default=CONFIG["vehicle_weights"])
     parser.add_argument("--plate-weights", default=CONFIG["plate_weights"])
@@ -665,6 +769,24 @@ def main():
     parser.add_argument("--min-confidence", type=float, default=CONFIG["min_confidence"])
     parser.add_argument("--save-qa-images", action="store_true", default=CONFIG["SAVE_QA_IMAGES"],
                          help="Save annotated QA review crops showing the cleaned OCR text overlay.")
+    parser.add_argument("--stream-frame-skip", type=int, default=CONFIG["stream_frame_skip"],
+                         help="Process one frame every N captured frames for RTSP input.")
+    parser.add_argument("--stream-width", type=int, default=CONFIG["stream_width"],
+                         help="Requested RTSP frame width; the camera may ignore this value.")
+    parser.add_argument("--stream-height", type=int, default=CONFIG["stream_height"],
+                         help="Requested RTSP frame height; the camera may ignore this value.")
+    parser.add_argument("--stream-fps", type=int, default=CONFIG["stream_fps"],
+                         help="Requested RTSP FPS; the camera may ignore this value.")
+    parser.add_argument("--stream-buffer-size", type=int, default=CONFIG["stream_buffer_size"],
+                         help="Capture buffer size; 1 minimizes live-feed delay.")
+    parser.add_argument("--stream-reconnect-delay", type=float,
+                         default=CONFIG["stream_reconnect_delay"],
+                         help="Seconds to wait before reconnecting after an RTSP failure.")
+    parser.add_argument("--stream-max-frames", type=int, default=CONFIG["stream_max_frames"],
+                         help="Stop after this many processed RTSP frames; 0 runs until stopped.")
+    parser.add_argument("--no-stream-preview", action="store_false", dest="show_stream_preview",
+                         default=CONFIG["stream_preview"],
+                         help="Disable the live OpenCV detection preview window for RTSP input.")
 
     parser.add_argument("--out-dir", default=CONFIG["out_dir"],
                          help="Base output folder. A dd-mm-yy folder is created inside it for "
@@ -673,11 +795,16 @@ def main():
 
     args = parser.parse_args()
 
-    if args.image and args.folder:
-        sys.exit("Error: set only one of --image / --folder (or CONFIG['image'] / CONFIG['folder']).")
-    if not args.image and not args.folder:
-        sys.exit("Error: no source set. Edit CONFIG['folder'] or CONFIG['image'] at the top of this "
-                  "file, or pass --image / --folder on the command line.")
+    if not args.image and not args.folder and not args.rtsp_url:
+        args.image = CONFIG["image"]
+        args.folder = CONFIG["folder"]
+        args.rtsp_url = CONFIG["rtsp_url"]
+
+    args.show_stream_preview = bool(args.rtsp_url and args.show_stream_preview)
+
+    if not args.image and not args.folder and not args.rtsp_url:
+        sys.exit("Error: no source set. Edit CONFIG['folder'], CONFIG['image'], or CONFIG['rtsp_url'] "
+                 "at the top of this file, or pass --image / --folder / --rtsp-url on the command line.")
     if args.folder and not os.path.isdir(args.folder):
         sys.exit(f"Error: folder not found: {args.folder}")
     if args.image and not os.path.isfile(args.image):
@@ -686,7 +813,15 @@ def main():
         sys.exit(f"Error: vehicle weights not found: {args.vehicle_weights}")
     if not os.path.isfile(args.plate_weights):
         sys.exit(f"Error: plate weights not found: {args.plate_weights}")
-    base_out_dir = args.out_dir or default_base_out_dir(args.image, args.folder)
+    if args.stream_frame_skip < 1:
+        sys.exit("Error: --stream-frame-skip must be at least 1.")
+    if args.stream_width < 0 or args.stream_height < 0 or args.stream_fps < 0:
+        sys.exit("Error: stream width, height, and FPS cannot be negative.")
+    if args.stream_buffer_size < 1:
+        sys.exit("Error: --stream-buffer-size must be at least 1.")
+    if args.stream_max_frames < 0:
+        sys.exit("Error: --stream-max-frames cannot be negative.")
+    base_out_dir = args.out_dir or default_base_out_dir(args.image, args.folder, args.rtsp_url)
     date_dir = make_date_dir(base_out_dir)
     vehicle_dir = os.path.join(date_dir, "vehicle_detection")
     plate_dir = os.path.join(date_dir, "plate_detection")
@@ -710,18 +845,26 @@ def main():
         image_paths = detect.list_images_in_folder(args.folder)
         if not image_paths:
             sys.exit(f"Error: no images ({sorted(detect.IMAGE_EXTENSIONS)}) found in: {args.folder}")
-    else:
+    elif args.image:
         image_paths = [args.image]
+    else:
+        image_paths = []
 
     work_dir = tempfile.mkdtemp(prefix="vehicle_plate_preprocess_")
     agg_rows: List[Dict[str, Any]] = []
     total_vehicles = 0
     try:
-        for image_path in image_paths:
-            total_vehicles += process_single_image(
-                image_path, args, vehicle_model, plate_model, ocr_engine,
+        if args.rtsp_url:
+            total_vehicles += process_rtsp_stream(
+                args.rtsp_url, args, vehicle_model, plate_model, ocr_engine,
                 date_dir, vehicle_dir, plate_dir, ocr_dir, work_dir, agg_rows,
             )
+        else:
+            for image_path in image_paths:
+                total_vehicles += process_single_image(
+                    image_path, args, vehicle_model, plate_model, ocr_engine,
+                    date_dir, vehicle_dir, plate_dir, ocr_dir, work_dir, agg_rows,
+                )
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
 
@@ -729,7 +872,7 @@ def main():
     plates_read = sum(1 for r in agg_rows if r["ocr_status"] == "read")
 
     print(f"\n=== Pipeline complete ===")
-    print(f"Images processed : {len(image_paths)}")
+    print(f"Images processed : {len(image_paths) if image_paths else 'stream'}")
     print(f"Vehicles cropped : {total_vehicles}")
     print(f"Plates read      : {plates_read}/{len(agg_rows)}")
     print(f"Log              : {log_path}")

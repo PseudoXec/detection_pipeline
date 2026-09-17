@@ -59,6 +59,7 @@ Open `main.py` and edit the `CONFIG` dict near the top:
 | `vehicle_weights` | Path to your trained `vehicle.pt` file. It must contain both vehicle and plate classes. |
 | `folder` | Path to a folder of photos to process (leave `image` as `None`) |
 | `image` | Path to a single photo (leave `folder` as `None`) |
+| `rtsp_url` | Optional RTSP camera URL (leave `image` and `folder` unset) |
 | `vehicle_classes` | Optional comma-separated vehicle class names, e.g. `"car,truck,bus"`. Plate detections are kept separately for matching. |
 
 Everything else in `CONFIG` has a working default - you don't need to
@@ -89,6 +90,49 @@ photo1_cropped_2_license_plate_61.jpg -> check (AB0122)
 an emitted plate result with no vehicle match. `read` = looks good. `check` =
 worth a manual look (unreadable crop or low OCR confidence).
 
+### Live RTSP camera
+
+You can put the camera URL directly in the `CONFIG` section of `main.py`:
+
+```python
+"image": None,
+"folder": None,
+"rtsp_url": r"rtsp://user:password@192.168.1.50:554/stream1",
+```
+
+Then run:
+
+```powershell
+python main.py
+```
+
+Or pass the URL without editing the file:
+
+```powershell
+python main.py --rtsp-url "rtsp://user:password@192.168.1.50:554/stream1"
+```
+
+The live mode reconnects after a failed read, requests 1280x720 at 15 FPS,
+keeps the capture buffer small, processes one frame every two captured frames
+by default, and opens an
+`RTSP detection preview` window with vehicle and plate boxes. Press `q` in
+that window or `Ctrl+C` in the terminal to stop. Adjust the stream settings with:
+
+```powershell
+python main.py --rtsp-url "rtsp://user:password@camera/stream" `
+  --stream-width 1280 --stream-height 720 --stream-fps 15 `
+  --stream-frame-skip 2 --stream-buffer-size 1
+```
+
+The camera's RTSP profile controls the maximum available quality. If the
+camera ignores width, height, or FPS requests, select its high-resolution or
+low-resolution stream profile in the URL instead, such as `stream1` or
+`stream2`.
+
+Stop a continuous stream with `Ctrl+C`. For a short connection test, use
+`--stream-max-frames`, for example `--stream-max-frames 10`.
+Use `--no-stream-preview` when running without a desktop display.
+
 ---
 
 ## 4. Where the results land
@@ -103,6 +147,11 @@ Inside `<folder>/vehicle_pipeline_output` (or wherever `--out-dir` points):
   `track_id` and plate index.
 - `pipeline_log.csv` contains one row per vehicle/plate result, including
   `track_id`, match method, containment, IoU, and orphan rows.
+
+RTSP output is written to the same date-based output folder. The current live
+mode processes sampled frames through the existing image pipeline; its
+per-frame IDs are not persistent tracker IDs, so duplicate-event suppression
+and temporal OCR confirmation should be added before production deployment.
 
 The current project has no temporal tracker, so `track_id` is an explicit
 per-frame identifier (`<source timestamp>_vN`), not a persistent cross-frame
