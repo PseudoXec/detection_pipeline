@@ -22,30 +22,37 @@ CONFIG = {
     "image": None,                                  # e.g. r"C:\cars\photo.jpg"
     "folder": None,                                 # e.g. r"C:\cars\sample_images"
     "rtsp_url": r"rtsp://admin:Victoria2313*@192.168.100.229:554/stream1",                          
-    "stream_frame_skip": 1,                         # process one frame every N captured frames
-    "stream_width": 1920,                           # requested RTSP capture width
-    "stream_height": 1080,                          # requested RTSP capture height
-    "stream_fps": 15,                               # requested RTSP capture FPS
+    "stream_frame_skip": 1,                         # detect every received frame at the slower stream rate
+    "stream_width": 1280,                           # requested RTSP capture width
+    "stream_height": 720,                          # requested RTSP capture height
+    "stream_fps": 0,                                # slower feed gives tracking more time per frame
     "stream_buffer_size": 1,                        # keep only the newest buffered frame
     "stream_reconnect_delay": 5.0,                  # seconds between reconnect attempts
     "stream_max_frames": 0,                         # 0 = run until stopped; useful for testing
     "stream_preview": True,                         # show live detection window for RTSP input
+    "stream_draw_boxes": False,                     # draw vehicle/plate boxes in the live RTSP preview
     "stream_preview_width": 1280,                   # preview window width
     "stream_preview_height": 720,                   # preview window height
+    "stream_preview_delay_ms": 100,                 # slow preview to roughly 10 display updates/sec
+    "stream_vehicle_conf_threshold": 0.25,          # RTSP-only threshold for more vehicle boxes
     "stream_track_iou_threshold": 0.3,              # minimum IoU to keep a vehicle track
     "stream_track_max_center_distance": 2.0,         # max center movement in vehicle-widths
     "stream_track_max_missing": 10,                 # processed frames before a track expires
+    "stream_tracking_cooldown_frames": 2,           # skip redundant tracking passes while a stable track is still alive
+    "stream_ocr_max_attempts": 2,                   # OCR attempts per tracked vehicle before giving up
+    "stream_ocr_confidence_threshold": 0.85,         # final accepted OCR confidence
+    "stream_plate_padding_ratio": 0.08,             # vehicle crop padding for live crops
 
     # --- Models ---
     "vehicle_weights": r"C:\Users\User\Documents\detection_pipeline\models\vehicle.pt",   # your trained vehicle .pt
-    "plate_weights": r"C:\Users\User\Documents\detection_pipeline\models\platenum.pt",   # your trained license-plate .pt
+    "plate_weights": r"C:\Users\User\Documents\detection_pipeline\models\platenum_closeup.pt",   # your trained license-plate .pt
     "device": None,                                       # None = auto (GPU if available)
 
     # --- Vehicle detection stage ---
     "vehicle_classes": None,            # e.g. "car,truck,bus,motorcycle"; None = keep all classes
     "vehicle_conf_threshold": 0.35,
     "vehicle_iou_threshold": 0.45,
-    "vehicle_crop_padding": 0.30,       # extra margin around each vehicle box (30%) - thumbnail only
+    "vehicle_crop_padding": 0.08,       # extra margin around each vehicle box (8%)
     "vehicle_crop_min_height": 200,     # zoom small vehicle crops up to at least this height (px)
 
     # --- Plate association stage (uses plate detections from vehicle.pt) ---
@@ -62,12 +69,14 @@ CONFIG = {
     "min_dim": detect.DEFAULT_MIN_DIM,
 
     # --- OCR stage ---
-    "model_tier": "server",             # "server" (accurate, default) | "mobile-en" (fast) | "default"
+    "model_tier": "mobile-en",          # lighter RTSP default: faster OCR for stable live tracks
     "single_pass": False,               # True = skip the raw/light/full best-of comparison
     "min_confidence": 0.80,             # below this, result is flagged "check"/LOWCONF
+    "skip_ocr": False,                   # Run OCR for plates when a crop is available
+    "detection_only": False,             # Keep crop + OCR enabled by default
 
     # --- QA / debug output ---
-    "SAVE_QA_IMAGES": True,             # Save annotated plate crops for manual review
+    "SAVE_QA_IMAGES": False,            # Disabled: do not save OCR-overlaid review images
 
     # --- Output ---
     "out_dir": None,                    # base folder; a dd-mm-yy folder is created inside it
@@ -98,7 +107,7 @@ def default_base_out_dir(image: Optional[str], folder: Optional[str], rtsp_url: 
 def source_timestamp(image_path: str) -> str:
     """Returns a filename-safe timestamp for a source image.
 
-    File inputs use their modification time. An RTSP capture should pass its
+    File inputs use their modification time. An RTSP capture should pass its`
     frame capture time instead when the live-feed adapter is added.
     """
     try:
@@ -231,6 +240,60 @@ def update_stream_tracks(
     tracker["next_track_number"] = next_track_number
 
 
+def should_reprocess_stream_tracks(
+    vehicle_predictions: List[Dict[str, Any]],
+    stream_track_state: Dict[str, Any],
+) -> bool:
+    """Only rerun expensive crop/OCR work while a track is new or incomplete."""
+    active_track_ids = {pred.get("track_id") for pred in vehicle_predictions if pred.get("track_id")}
+
+    if not stream_track_state and not active_track_ids:
+        return True
+
+    if not vehicle_predictions:
+        return False
+
+    if not active_track_ids:
+        return False
+
+    for track_id in active_track_ids:
+        state = stream_track_state.get(track_id)
+        if state is None:
+            return True
+        if state.get("finalized"):
+            continue
+        if state.get("ocr_pending"):
+            return True
+        if not state.get("ocr_done", False):
+            return True
+    return False
+
+
+def should_trigger_tracking_for_frame(
+    frame_number: int,
+    last_tracking_frame: int,
+    stream_track_state: Dict[str, Any],
+    cooldown_frames: int = 2,
+) -> bool:
+    """Avoid redundant detections when all current tracks are already stable."""
+    if cooldown_frames < 0:
+        cooldown_frames = 0
+    if frame_number - last_tracking_frame < cooldown_frames:
+        return False
+
+    if not stream_track_state:
+        return True
+
+    for state in stream_track_state.values():
+        if state.get("finalized"):
+            continue
+        if state.get("ocr_pending"):
+            return True
+        if not state.get("ocr_done", False):
+            return True
+    return False
+
+
 def _box_edges(box: Dict[str, Any]) -> Tuple[float, float, float, float]:
     """Return a center-based detection box as left, top, right, bottom."""
     return (
@@ -361,8 +424,12 @@ def draw_detection_preview(
     frame: np.ndarray,
     vehicle_predictions: List[Dict[str, Any]],
     plate_predictions: List[Dict[str, Any]],
+    draw_boxes: bool = False,
 ) -> np.ndarray:
-    """Draw vehicle and plate boxes for the optional live RTSP preview."""
+    """Optionally draw vehicle and plate boxes for the live RTSP preview."""
+    if not draw_boxes:
+        return np.array(frame, copy=True)
+
     preview = np.array(frame, copy=True)
     for prediction, color, label in [
         *[(prediction, (0, 200, 0), "vehicle") for prediction in vehicle_predictions],
@@ -379,51 +446,36 @@ def draw_detection_preview(
     return preview
 
 
-def draw_ocr_on_plate(
-    plate_crop: np.ndarray,
-    ocr_text: str,
-    confidence: Optional[float] = None,
-    output_path: Optional[str] = None,
-    font_scale: float = 0.8,
-    thickness: int = 2,
-) -> np.ndarray:
-    """Overlay OCR text beneath a plate crop for QA/debug review.
-
-    The crop itself is kept intact and a padded canvas is created below it so
-    the text does not occlude the plate. When confidence is supplied, it is
-    appended as a secondary value alongside the cleaned OCR text.
-    """
-    if plate_crop is None:
-        return plate_crop
-
-    image = np.array(plate_crop, copy=True)
-    if image.ndim == 2:
-        image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
-    if image.ndim != 3 or image.shape[2] != 3:
-        raise ValueError("plate_crop must be a BGR/OpenCV image array")
-
-    text = str(ocr_text or "UNRECOGNIZED")
-    if confidence is not None:
-        text = f"{text} ({confidence:.2f})"
-
-    height, width = image.shape[:2]
-    text_size, _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
-    pad_height = max(40, text_size[1] + 20)
-    canvas_height = height + pad_height
-    canvas = np.full((canvas_height, width, 3), 230, dtype=np.uint8)
-    canvas[:height, :, :] = image
-
-    text_x = 10
-    text_y = height + text_size[1] + 10
-    cv2.putText(canvas, text, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (20, 20, 20), thickness, cv2.LINE_AA)
-
-    if output_path:
-        output_dir = os.path.dirname(output_path)
-        if output_dir:
-            os.makedirs(output_dir, exist_ok=True)
-        cv2.imwrite(output_path, canvas)
-
-    return canvas
+def finalize_stream_track(
+    track_id: str,
+    state: Dict[str, Any],
+    args: Any,
+    date_dir: str,
+    agg_rows: List[Dict[str, Any]],
+    force: bool = False,
+) -> None:
+    """Write one final CSV row when a stream track is accepted or expires."""
+    if state["finalized"] or state.get("ocr_pending"):
+        return
+    if not force and not state["ocr_done"]:
+        return
+    state["finalized"] = True
+    if not state["ocr_done"]:
+        state["ocr_status"] = "low_confidence"
+    row = dict(state["base_row"])
+    row.update({
+        "plate_index": 1,
+        "match_method": "vehicle_crop",
+        "containment_ratio": "1.0000",
+        "iou": "1.0000",
+        "plate_crop": os.path.relpath(state["plate_path"], date_dir) if state["plate_path"] else "",
+        "raw_ocr_text": state["raw_ocr_text"],
+        "plate_text": state["plate_text"],
+        "plate_confidence": f"{state['best_ocr_conf']:.4f}",
+        "ocr_status": state["ocr_status"],
+        "ocr_file": "",
+    })
+    agg_rows.append(row)
 
 
 def run_ocr_on_plate_crops(
@@ -471,13 +523,6 @@ def run_ocr_on_plate_crops(
             "variant": winning_variant,
             "status": status,
         }
-        if getattr(args, "save_qa_images", False):
-            base_row = result_record.get("base_row", {})
-            track_id = base_row.get("track_id") or f"orphan_{record['plate_index']}"
-            frame_id = os.path.splitext(os.path.basename(base_row.get("source_image", "frame")))[0]
-            qa_name = f"{track_id}_{frame_id}_{record['plate_index']}"
-            qa_path = os.path.join(getattr(args, "qa_dir", os.path.join(os.path.dirname(ocr_dir), "qa_review")), f"{qa_name}.jpg")
-            draw_ocr_on_plate(plate_image, cleaned_text, conf, qa_path)
         results.append(result_record)
 
     return results
@@ -496,7 +541,7 @@ def process_single_image(
     work_dir: str,
     agg_rows: List[Dict[str, Any]],
 ) -> int:
-    """Run vehicle and plate detection independently on one raw source frame."""
+    """Detect vehicles, then detect plates inside each vehicle crop and OCR them."""
     filename = os.path.basename(image_path)
     timestamp = source_timestamp(image_path)
     detection_input_path = image_path
@@ -514,10 +559,6 @@ def process_single_image(
             )
         else:
             vehicle_preds = [dict(prediction) for prediction in tracked_vehicle_preds]
-        plate_preds = detect.run_local_detection(
-            plate_model, detection_input_path, args.plate_conf_threshold,
-            args.vehicle_iou_threshold, args.imgsz, None,
-        )
     except (FileNotFoundError, detect.LocalInferenceError) as e:
         print(f"{filename} -> vehicle detection error: {e}")
         return 0
@@ -525,10 +566,6 @@ def process_single_image(
     vehicle_preds = [
         pred for pred in vehicle_preds
         if not is_plate_prediction(pred)
-    ]
-    plate_preds = [
-        pred for pred in plate_preds
-        if is_plate_prediction(pred)
     ]
     stream_tracker = getattr(args, "_stream_tracker", None)
     if tracked_vehicle_preds is not None and any("track_id" in pred for pred in vehicle_preds):
@@ -550,13 +587,29 @@ def process_single_image(
         print(f"{filename} -> could not reload raw frame")
         return 0
 
-    matches = match_plates_to_vehicles(
-        vehicle_preds,
-        plate_preds,
-        args.plate_containment_threshold,
-        args.plate_min_iou,
-    )
-    print(f"{filename} -> {len(vehicle_preds)} vehicle(s), {len(plate_preds)} plate(s) detected")
+    stream_track_state = getattr(args, "_stream_track_state", None)
+    stream_frame_number = int(getattr(args, "_stream_current_frame", 0))
+
+    preview_state = getattr(args, "_stream_preview_state", None)
+    if preview_state is not None:
+        with preview_state["lock"]:
+            preview_state["vehicle_predictions"] = [dict(prediction) for prediction in vehicle_preds]
+            preview_state["plate_predictions"] = []
+
+    print(f"{filename} -> {len(vehicle_preds)} vehicle(s) detected")
+
+    if getattr(args, "detection_only", False):
+        for vehicle in vehicle_preds:
+            agg_rows.append({
+                "source_image": filename,
+                "track_id": vehicle["track_id"],
+                "vehicle_id": vehicle["track_id"],
+                "vehicle_class": str(vehicle.get("class") or "vehicle"),
+                "raw_ocr_text": "",
+                "plate_text": "",
+                "ocr_status": "detection_only",
+            })
+        return 0
 
     saved_vehicle_crops = getattr(args, "_saved_vehicle_crops", {})
     saved_plate_crops = getattr(args, "_saved_plate_crops", {})
@@ -565,6 +618,7 @@ def process_single_image(
 
     vehicle_rows: Dict[str, Dict[str, Any]] = {}
     vehicle_match_counts: Dict[str, int] = {}
+    vehicle_crop_images: Dict[str, np.ndarray] = {}
     vehicle_count = 0
     for pred in vehicle_preds:
         track_id = pred["track_id"]
@@ -577,11 +631,13 @@ def process_single_image(
         vehicle_crop_path = ""
         if track_id in saved_vehicle_crops:
             vehicle_crop_path = saved_vehicle_crops[track_id]
+            vehicle_crop_images[track_id] = cv2.imread(vehicle_crop_path)
         elif vehicle_crop is not None:
             vehicle_name = unique_stem(vehicle_dir, f"{track_id}_{safe_cls}")
             vehicle_crop_path = os.path.join(vehicle_dir, f"{vehicle_name}.png")
             cv2.imwrite(vehicle_crop_path, vehicle_crop)
             saved_vehicle_crops[track_id] = vehicle_crop_path
+            vehicle_crop_images[track_id] = vehicle_crop
             vehicle_count += 1
         else:
             vehicle_name = track_id
@@ -599,56 +655,49 @@ def process_single_image(
 
     plate_records: List[Dict[str, Any]] = []
     immediate_rows: List[Dict[str, Any]] = []
-    for match in matches:
-        track_id = match["track_id"]
+    plate_predictions_for_preview: List[Dict[str, Any]] = []
+    for vehicle_index, vehicle in enumerate(vehicle_preds, start=1):
+        if stream_track_state is not None:
+            continue
+        track_id = vehicle["track_id"]
         if track_id is not None and track_id in saved_plate_crops:
             print(f"  {track_id} -> plate crop already saved; skipping duplicate")
             continue
-        if track_id is None:
-            base_row = {
-                "source_image": filename,
-                "track_id": "",
-                "vehicle_id": "",
-                "vehicle_class": "",
-                "vehicle_confidence": "",
-                "vehicle_crop": "",
-            }
-        else:
-            base_row = vehicle_rows[track_id]
-            vehicle_match_counts[track_id] += 1
 
-        plate_image = crop_plate(
-            full_img, match["plate_box"], args.plate_crop_padding, args.plate_crop_min_height,
-        )
-        plate_prefix = track_id or f"orphan_{timestamp}"
-        plate_name = f"{plate_prefix}_plate_{match['plate_index']}"
-        plate_path = os.path.join(plate_dir, f"{unique_stem(plate_dir, plate_name)}.png")
-        if plate_image is None or not cv2.imwrite(plate_path, plate_image):
-            row = dict(base_row)
-            row.update({
-                "plate_index": match["plate_index"],
-                "match_method": match["match_method"],
-                "containment_ratio": f"{match['containment_ratio']:.4f}",
-                "iou": f"{match['iou']:.4f}",
-                "plate_crop": "",
-                "plate_text": "",
-                "plate_confidence": "",
-                "ocr_status": "uncroppable_plate",
-                "ocr_file": "",
-            })
-            immediate_rows.append(row)
+        if track_id not in vehicle_crop_images or vehicle_crop_images[track_id] is None:
+            continue
+        vehicle_crop = vehicle_crop_images[track_id]
+        vehicle_crop_path = saved_vehicle_crops[track_id]
+        try:
+            vehicle_plate_preds = detect.run_local_detection(
+                plate_model, vehicle_crop_path, args.plate_conf_threshold,
+                args.vehicle_iou_threshold, args.imgsz, None,
+            )
+        except (FileNotFoundError, detect.LocalInferenceError) as error:
+            print(f"  {track_id} -> plate detection error: {error}")
+            vehicle_plate_preds = []
+        if not vehicle_plate_preds:
             continue
 
-        if track_id is not None:
-            saved_plate_crops[track_id] = plate_path
+        best_plate = max(vehicle_plate_preds, key=lambda item: item.get("confidence", 0.0))
+        plate_image = crop_plate(
+            vehicle_crop, best_plate, args.plate_crop_padding, args.plate_crop_min_height,
+        )
+        plate_name = f"{track_id}_plate_1"
+        plate_path = os.path.join(plate_dir, f"{unique_stem(plate_dir, plate_name)}.png")
+        if plate_image is None or not cv2.imwrite(plate_path, plate_image):
+            continue
+
+        saved_plate_crops[track_id] = plate_path
+        vehicle_match_counts[track_id] += 1
 
         plate_records.append({
-            "base_row": base_row,
-            "plate_index": match["plate_index"],
-            "match_method": match["match_method"],
+            "base_row": vehicle_rows[track_id],
+            "plate_index": 1,
+            "match_method": "vehicle_crop",
             "plate_path": plate_path,
-            "containment_ratio": match["containment_ratio"],
-            "iou": match["iou"],
+            "containment_ratio": 1.0,
+            "iou": 1.0,
         })
 
     for track_id, base_row in vehicle_rows.items():
@@ -667,7 +716,110 @@ def process_single_image(
             })
             immediate_rows.append(row)
 
+    if stream_track_state is not None:
+        max_attempts = max(1, int(getattr(args, "stream_ocr_max_attempts", 3)))
+        confidence_threshold = float(getattr(args, "stream_ocr_confidence_threshold", 0.85))
+        for vehicle in vehicle_preds:
+            track_id = vehicle["track_id"]
+            state = stream_track_state.setdefault(track_id, {
+                "best_plate_conf": 0.0,
+                "best_ocr_conf": 0.0,
+                "plate_text": "UNRECOGNIZED",
+                "ocr_done": False,
+                "last_seen_frame": stream_frame_number,
+                "ocr_attempts": 0,
+                "base_row": vehicle_rows[track_id],
+                "plate_path": "",
+                "plate_image": None,
+                "raw_ocr_text": "NO_TEXT",
+                "ocr_status": "low_confidence",
+                "ocr_pending": False,
+                "finalized": False,
+            })
+            state["last_seen_frame"] = stream_frame_number
+            state["base_row"] = vehicle_rows[track_id]
+            if state["ocr_done"] or state["ocr_attempts"] >= max_attempts:
+                continue
+
+            vehicle_crop_path = saved_vehicle_crops.get(track_id, "")
+            if not vehicle_crop_path:
+                continue
+            try:
+                vehicle_plate_preds = detect.run_local_detection(
+                    plate_model, vehicle_crop_path, args.plate_conf_threshold,
+                    args.vehicle_iou_threshold, args.imgsz, None,
+                )
+            except (FileNotFoundError, detect.LocalInferenceError) as error:
+                print(f"  {track_id} -> plate detection error: {error}")
+                continue
+            if not vehicle_plate_preds:
+                continue
+
+            best_plate = max(vehicle_plate_preds, key=lambda item: item.get("confidence", 0.0))
+            plate_conf = float(best_plate.get("confidence", 0.0))
+            if state["ocr_attempts"] and plate_conf <= state["best_plate_conf"]:
+                continue
+            state["ocr_attempts"] += 1
+            state["best_plate_conf"] = plate_conf
+            vehicle_crop = vehicle_crop_images.get(track_id)
+            if vehicle_crop is None:
+                vehicle_crop = cv2.imread(vehicle_crop_path)
+            plate_image = crop_plate(
+                vehicle_crop, best_plate, args.plate_crop_padding, args.plate_crop_min_height,
+            ) if vehicle_crop is not None else None
+            if plate_image is None:
+                continue
+
+            plate_path = state["plate_path"] or os.path.join(plate_dir, f"{track_id}_plate_1.png")
+            if not cv2.imwrite(plate_path, plate_image):
+                continue
+            state["plate_path"] = plate_path
+            state["plate_image"] = plate_image
+            ocr_queue = getattr(args, "_stream_ocr_queue", None)
+            if ocr_queue is None:
+                text, ocr_conf = ocr.read_plate_text(ocr_engine, plate_image)
+                cleaned_text = ocr.clean_plate_text(text)
+                if ocr_conf >= state["best_ocr_conf"]:
+                    state["best_ocr_conf"] = float(ocr_conf)
+                    state["plate_text"] = cleaned_text
+                    state["raw_ocr_text"] = text if text else "NO_TEXT"
+                if cleaned_text != "UNRECOGNIZED" and ocr_conf >= confidence_threshold:
+                    state["ocr_done"] = True
+                    state["ocr_status"] = "read"
+            else:
+                try:
+                    state["ocr_pending"] = True
+                    ocr_queue.put_nowait((track_id, plate_image.copy()))
+                except queue.Full:
+                    state["ocr_pending"] = False
+
+        for track_id, state in stream_track_state.items():
+            if state["finalized"] or state.get("ocr_pending"):
+                continue
+            if state["ocr_done"] or stream_frame_number - state["last_seen_frame"] > getattr(args, "stream_track_max_missing", 10):
+                finalize_stream_track(track_id, state, args, date_dir, agg_rows, force=not state["ocr_done"])
+        return vehicle_count
+
     agg_rows.extend(immediate_rows)
+    if getattr(args, "skip_ocr", False):
+        for record in plate_records:
+            row = dict(record["base_row"])
+            row.update({
+                "plate_index": record["plate_index"],
+                "match_method": record["match_method"],
+                "containment_ratio": f"{record['containment_ratio']:.4f}",
+                "iou": f"{record['iou']:.4f}",
+                "plate_crop": os.path.relpath(record["plate_path"], date_dir),
+                "raw_ocr_text": "",
+                "plate_text": "",
+                "plate_confidence": "",
+                "ocr_status": "ocr_disabled",
+                "ocr_file": "",
+            })
+            agg_rows.append(row)
+        print(f"  {len(plate_records)} plate crop(s) saved; OCR disabled")
+        return vehicle_count
+
     print(f"  {len(plate_records)} plate crop(s) saved from raw frame, running OCR...")
     ocr_results = run_ocr_on_plate_crops(ocr_engine, plate_records, ocr_dir, args)
     for result in ocr_results:
@@ -691,11 +843,10 @@ def process_single_image(
         })
         agg_rows.append(row)
 
-    preview_state = getattr(args, "_stream_preview_state", None)
     if preview_state is not None:
         with preview_state["lock"]:
             preview_state["vehicle_predictions"] = [dict(prediction) for prediction in vehicle_preds]
-            preview_state["plate_predictions"] = [dict(prediction) for prediction in plate_preds]
+            preview_state["plate_predictions"] = plate_predictions_for_preview
 
     return vehicle_count
 
@@ -761,11 +912,14 @@ def process_rtsp_stream(
 
     capture.set(cv2.CAP_PROP_FRAME_WIDTH, max(0, int(getattr(args, "stream_width", 1280))))
     capture.set(cv2.CAP_PROP_FRAME_HEIGHT, max(0, int(getattr(args, "stream_height", 720))))
-    capture.set(cv2.CAP_PROP_FPS, max(0, int(getattr(args, "stream_fps", 15))))
+    stream_fps = getattr(args, "stream_fps", None)
+    if stream_fps:
+        capture.set(cv2.CAP_PROP_FPS, max(1, int(stream_fps)))
     capture.set(cv2.CAP_PROP_BUFFERSIZE, max(1, int(getattr(args, "stream_buffer_size", 1))))
     reader = threading.Thread(target=read_latest_frames, daemon=True)
     reader.start()
     args._stream_tracker = {"tracks": {}, "next_track_number": 1}
+    args._stream_track_state = {}
     preview_state = {
         "lock": threading.Lock(),
         "vehicle_predictions": [],
@@ -773,6 +927,7 @@ def process_rtsp_stream(
     }
     args._stream_preview_state = preview_state
     inference_queue: queue.Queue = queue.Queue(maxsize=1)
+    ocr_queue: queue.Queue = queue.Queue(maxsize=1)
     worker_stop = threading.Event()
     worker_state = {"processed_frames": 0, "total_vehicles": 0}
 
@@ -791,21 +946,34 @@ def process_rtsp_stream(
             except queue.Empty:
                 continue
             try:
+                args._stream_current_frame = frame_number
                 args._stream_vehicle_predictions = detect.run_local_tracking(
                     vehicle_model,
                     inference_frame,
-                    getattr(args, "vehicle_conf_threshold", 0.35),
+                    getattr(args, "stream_vehicle_conf_threshold", 0.25),
                     getattr(args, "vehicle_iou_threshold", 0.45),
                     getattr(args, "imgsz", None),
                     set(c.strip() for c in args.vehicle_classes.split(",") if c.strip())
                     if getattr(args, "vehicle_classes", None) else None,
                 )
-                worker_state["total_vehicles"] += process_single_image(
-                    frame_path, args, vehicle_model, plate_model, ocr_engine,
-                    date_dir, vehicle_dir, plate_dir, ocr_dir, work_dir, agg_rows,
-                )
-                worker_state["processed_frames"] += 1
-                print(f"[stream] Processed frame {worker_state['processed_frames']} (captured {frame_number})")
+                with preview_state["lock"]:
+                    preview_state["vehicle_predictions"] = [
+                        dict(prediction) for prediction in args._stream_vehicle_predictions
+                        if not is_plate_prediction(prediction)
+                    ]
+
+                stream_track_state = getattr(args, "_stream_track_state", {})
+                tracked_predictions = [dict(prediction) for prediction in args._stream_vehicle_predictions if not is_plate_prediction(prediction)]
+                if should_reprocess_stream_tracks(tracked_predictions, stream_track_state):
+                    worker_state["total_vehicles"] += process_single_image(
+                        frame_path, args, vehicle_model, plate_model, ocr_engine,
+                        date_dir, vehicle_dir, plate_dir, ocr_dir, work_dir, agg_rows,
+                    )
+                    worker_state["processed_frames"] += 1
+                    print(f"[stream] Processed frame {worker_state['processed_frames']} (captured {frame_number})")
+                else:
+                    worker_state["processed_frames"] += 1
+                    print(f"[stream] Tracking continued without crop/OCR rerun on frame {frame_number}")
             except (FileNotFoundError, detect.LocalInferenceError) as error:
                 print(f"[stream] Inference error on frame {frame_number}: {error}")
             finally:
@@ -813,9 +981,37 @@ def process_rtsp_stream(
                     del args._stream_vehicle_predictions
                 inference_queue.task_done()
 
+    def run_ocr_worker() -> None:
+        while not worker_stop.is_set() or not ocr_queue.empty():
+            try:
+                track_id, plate_image = ocr_queue.get(timeout=0.05)
+            except queue.Empty:
+                continue
+            try:
+                state = args._stream_track_state.get(track_id)
+                if state is None or state["finalized"]:
+                    continue
+                text, ocr_conf = ocr.read_plate_text(ocr_engine, plate_image)
+                cleaned_text = ocr.clean_plate_text(text)
+                state["ocr_pending"] = False
+                if ocr_conf >= state["best_ocr_conf"]:
+                    state["best_ocr_conf"] = float(ocr_conf)
+                    state["plate_text"] = cleaned_text
+                    state["raw_ocr_text"] = text if text else "NO_TEXT"
+                if cleaned_text != "UNRECOGNIZED" and ocr_conf >= getattr(args, "stream_ocr_confidence_threshold", 0.85):
+                    state["ocr_done"] = True
+                    state["ocr_status"] = "read"
+                    finalize_stream_track(track_id, state, args, date_dir, agg_rows)
+            finally:
+                ocr_queue.task_done()
+
     inference_worker = threading.Thread(target=run_inference_worker, daemon=True)
+    ocr_worker = threading.Thread(target=run_ocr_worker, daemon=True)
     inference_worker.start()
+    ocr_worker.start()
     last_submitted_frame = 0
+    last_tracking_frame = 0
+    tracking_cooldown_frames = max(0, int(getattr(args, "stream_tracking_cooldown_frames", 2)))
 
     try:
         while max_frames == 0 or worker_state["processed_frames"] < max_frames:
@@ -832,9 +1028,14 @@ def process_rtsp_stream(
                 with preview_state["lock"]:
                     vehicle_predictions = preview_state["vehicle_predictions"]
                     plate_predictions = preview_state["plate_predictions"]
-                preview = draw_detection_preview(frame, vehicle_predictions, plate_predictions)
+                preview = draw_detection_preview(
+                    frame,
+                    vehicle_predictions,
+                    plate_predictions,
+                    draw_boxes=bool(getattr(args, "stream_draw_boxes", False)),
+                )
                 cv2.imshow("RTSP detection preview", preview)
-                if cv2.waitKey(1) & 0xFF == ord("q"):
+                if cv2.waitKey(max(1, int(getattr(args, "stream_preview_delay_ms", 100)))) & 0xFF == ord("q"):
                     stop_preview.set()
                     stop_reader.set()
                     break
@@ -848,6 +1049,14 @@ def process_rtsp_stream(
             if not inference_queue.empty():
                 time.sleep(0.005)
                 continue
+            if not should_trigger_tracking_for_frame(
+                frame_number,
+                last_tracking_frame,
+                getattr(args, "_stream_track_state", {}),
+                tracking_cooldown_frames,
+            ):
+                last_submitted_frame = frame_number
+                continue
 
             frame_name = datetime.now().strftime("stream_%Y%m%d_%H%M%S_%f.jpg")
             frame_path = os.path.join(work_dir, frame_name)
@@ -855,17 +1064,25 @@ def process_rtsp_stream(
                 print(f"[stream] Could not stage frame {frame_number}")
                 last_submitted_frame = frame_number
                 continue
+            args._stream_current_frame = frame_number
             inference_queue.put((frame_path, frame_number, frame.copy()))
             last_submitted_frame = frame_number
+            last_tracking_frame = frame_number
     except KeyboardInterrupt:
         print("\n[stream] Stopped by user")
     finally:
         stop_preview.set()
         inference_queue.join()
+        ocr_queue.join()
+        for track_id, state in args._stream_track_state.items():
+            finalize_stream_track(track_id, state, args, date_dir, agg_rows, force=True)
         worker_stop.set()
         inference_worker.join(timeout=2.0)
+        ocr_worker.join(timeout=2.0)
         if hasattr(args, "_stream_tracker"):
             del args._stream_tracker
+        if hasattr(args, "_stream_track_state"):
+            del args._stream_track_state
         if hasattr(args, "_stream_preview_state"):
             del args._stream_preview_state
         stop_preview.set()
@@ -923,8 +1140,10 @@ def main():
     parser.add_argument("--model-tier", choices=sorted(ocr.MODEL_TIERS), default=CONFIG["model_tier"])
     parser.add_argument("--single-pass", action="store_true", default=CONFIG["single_pass"])
     parser.add_argument("--min-confidence", type=float, default=CONFIG["min_confidence"])
-    parser.add_argument("--save-qa-images", action="store_true", default=CONFIG["SAVE_QA_IMAGES"],
-                         help="Save annotated QA review crops showing the cleaned OCR text overlay.")
+    parser.add_argument("--skip-ocr", action="store_true", default=CONFIG["skip_ocr"],
+                         help="Disable OCR and save only vehicle/plate detections and crops.")
+    parser.add_argument("--detection-only", action="store_true", default=CONFIG["detection_only"],
+                         help="Run vehicle detection only; disable all cropping, plate detection, and OCR.")
     parser.add_argument("--stream-frame-skip", type=int, default=CONFIG["stream_frame_skip"],
                          help="Process one frame every N captured frames for RTSP input.")
     parser.add_argument("--stream-width", type=int, default=CONFIG["stream_width"],
@@ -935,6 +1154,14 @@ def main():
                          help="Requested RTSP FPS; the camera may ignore this value.")
     parser.add_argument("--stream-buffer-size", type=int, default=CONFIG["stream_buffer_size"],
                          help="Capture buffer size; 1 minimizes live-feed delay.")
+    parser.add_argument("--stream-preview-delay-ms", type=int,
+                         default=CONFIG["stream_preview_delay_ms"],
+                         help="Preview delay in milliseconds; larger values slow the display.")
+    parser.add_argument("--stream-draw-boxes", action="store_true", default=CONFIG["stream_draw_boxes"],
+                         help="Overlay detected vehicle and plate boxes on the RTSP preview image.")
+    parser.add_argument("--no-stream-draw-boxes", action="store_false", dest="stream_draw_boxes",
+                         default=CONFIG["stream_draw_boxes"],
+                         help="Disable the vehicle/plate box overlay on the RTSP preview image.")
     parser.add_argument("--stream-track-iou-threshold", type=float,
                          default=CONFIG["stream_track_iou_threshold"],
                          help="Minimum box overlap used to keep a vehicle's RTSP track.")
@@ -944,11 +1171,23 @@ def main():
     parser.add_argument("--stream-track-max-missing", type=int,
                          default=CONFIG["stream_track_max_missing"],
                          help="Processed RTSP frames a track may disappear before expiring.")
+    parser.add_argument("--stream-tracking-cooldown-frames", type=int,
+                         default=CONFIG["stream_tracking_cooldown_frames"],
+                         help="Skip redundant RTSP tracking passes for a few frames after a stable track is live.")
     parser.add_argument("--stream-reconnect-delay", type=float,
                          default=CONFIG["stream_reconnect_delay"],
                          help="Seconds to wait before reconnecting after an RTSP failure.")
     parser.add_argument("--stream-max-frames", type=int, default=CONFIG["stream_max_frames"],
                          help="Stop after this many processed RTSP frames; 0 runs until stopped.")
+    parser.add_argument("--stream-vehicle-conf-threshold", type=float,
+                         default=CONFIG["stream_vehicle_conf_threshold"],
+                         help="RTSP-only vehicle confidence threshold; lower values show more boxes.")
+    parser.add_argument("--stream-ocr-max-attempts", type=int,
+                         default=CONFIG["stream_ocr_max_attempts"],
+                         help="Maximum plate/OCR attempts for each RTSP track.")
+    parser.add_argument("--stream-ocr-confidence-threshold", type=float,
+                         default=CONFIG["stream_ocr_confidence_threshold"],
+                         help="OCR confidence that finalizes an RTSP track.")
     parser.add_argument("--no-stream-preview", action="store_false", dest="show_stream_preview",
                          default=CONFIG["stream_preview"],
                          help="Disable the live OpenCV detection preview window for RTSP input.")
@@ -976,41 +1215,56 @@ def main():
         sys.exit(f"Error: image not found: {args.image}")
     if not os.path.isfile(args.vehicle_weights):
         sys.exit(f"Error: vehicle weights not found: {args.vehicle_weights}")
-    if not os.path.isfile(args.plate_weights):
+    if not args.detection_only and not os.path.isfile(args.plate_weights):
         sys.exit(f"Error: plate weights not found: {args.plate_weights}")
     if args.stream_frame_skip < 1:
         sys.exit("Error: --stream-frame-skip must be at least 1.")
-    if args.stream_width < 0 or args.stream_height < 0 or args.stream_fps < 0:
+    if args.stream_width < 0 or args.stream_height < 0 or (args.stream_fps is not None and args.stream_fps < 0):
         sys.exit("Error: stream width, height, and FPS cannot be negative.")
     if args.stream_buffer_size < 1:
         sys.exit("Error: --stream-buffer-size must be at least 1.")
+    if args.stream_preview_delay_ms < 1:
+        sys.exit("Error: --stream-preview-delay-ms must be at least 1.")
     if not 0.0 <= args.stream_track_iou_threshold <= 1.0:
         sys.exit("Error: --stream-track-iou-threshold must be between 0 and 1.")
     if args.stream_track_max_center_distance < 0:
         sys.exit("Error: --stream-track-max-center-distance cannot be negative.")
     if args.stream_track_max_missing < 0:
         sys.exit("Error: --stream-track-max-missing cannot be negative.")
+    if args.stream_tracking_cooldown_frames < 0:
+        sys.exit("Error: --stream-tracking-cooldown-frames cannot be negative.")
     if args.stream_max_frames < 0:
         sys.exit("Error: --stream-max-frames cannot be negative.")
+    if args.stream_ocr_max_attempts < 1:
+        sys.exit("Error: --stream-ocr-max-attempts must be at least 1.")
+    if args.stream_ocr_confidence_threshold < 0.0 or args.stream_ocr_confidence_threshold > 1.0:
+        sys.exit("Error: --stream-ocr-confidence-threshold must be between 0 and 1.")
+    if not 0.0 <= args.stream_vehicle_conf_threshold <= 1.0:
+        sys.exit("Error: --stream-vehicle-conf-threshold must be between 0 and 1.")
     base_out_dir = args.out_dir or default_base_out_dir(args.image, args.folder, args.rtsp_url)
     date_dir = make_date_dir(base_out_dir)
     vehicle_dir = os.path.join(date_dir, "vehicle_detection")
     plate_dir = os.path.join(date_dir, "plate_detection")
     ocr_dir = os.path.join(date_dir, "ocr")
-    qa_dir = os.path.join(date_dir, "qa_review")
     os.makedirs(vehicle_dir, exist_ok=True)
     os.makedirs(plate_dir, exist_ok=True)
-    if args.save_qa_images:
-        os.makedirs(qa_dir, exist_ok=True)
-    args.qa_dir = qa_dir
     print(f"[info] Output folder for this run: {date_dir}")
 
     print("[info] Loading vehicle detection model...")
     vehicle_model = detect.build_model(args.vehicle_weights, args.device)
-    print("[info] Loading plate detection model...")
-    plate_model = detect.build_model(args.plate_weights, args.device)
-    print(f"[info] Loading PaddleOCR engine (model tier: {args.model_tier})...")
-    ocr_engine = ocr.build_ocr_engine(args.model_tier)
+    if args.detection_only:
+        print("[info] Detection-only mode; plate model, cropping, and OCR disabled")
+        plate_model = None
+        ocr_engine = None
+    else:
+        print("[info] Loading plate detection model...")
+        plate_model = detect.build_model(args.plate_weights, args.device)
+        if args.skip_ocr:
+            print("[info] OCR disabled; running detection and crop stages only")
+            ocr_engine = None
+        else:
+            print(f"[info] Loading PaddleOCR engine (model tier: {args.model_tier})...")
+            ocr_engine = ocr.build_ocr_engine(args.model_tier)
 
     if args.folder:
         image_paths = detect.list_images_in_folder(args.folder)

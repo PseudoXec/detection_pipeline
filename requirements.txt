@@ -1,5 +1,5 @@
 ultralytics
-paddleocr
 paddlepaddle
+paddleocr
 opencv-python
 numpy

@@ -3,7 +3,16 @@ import csv
 import os
 
 import cv2
-from paddleocr import PaddleOCR
+
+try:
+    from paddleocr import PaddleOCR
+except ImportError:
+    try:
+        from paddleocr_lite import PaddleOCR
+    except ImportError as exc:
+        raise ImportError(
+            "PaddleOCR is not installed. Install 'paddleocr' or the local Lite package to enable OCR."
+        ) from exc
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 MIN_HEIGHT = 64  # upscale anything shorter than this

@@ -6,9 +6,8 @@ Three files, one command:
   photos and crops out every detection.
 - `ocr_cropped_plates.py` - runs PaddleOCR on every crop and renames it to
   the recognized text.
-- `main.py` - runs vehicle and plate detection independently on the same raw
-  frame, matches plate boxes to vehicles, then runs OCR. This is the only file
-  you run.
+- `main.py` - detects vehicles, runs plate detection inside each vehicle crop,
+  then runs OCR on each plate crop. This is the only file you run.
 
 All three must live in the **same folder**.
 
@@ -60,7 +59,7 @@ Open `main.py` and edit the `CONFIG` dict near the top:
 | `folder` | Path to a folder of photos to process (leave `image` as `None`) |
 | `image` | Path to a single photo (leave `folder` as `None`) |
 | `rtsp_url` | Optional RTSP camera URL (leave `image` and `folder` unset) |
-| `vehicle_classes` | Optional comma-separated vehicle class names, e.g. `"car,truck,bus"`. Plate detections are kept separately for matching. |
+| `vehicle_classes` | Optional comma-separated vehicle class names, e.g. `"car,truck,bus"`. |
 
 Everything else in `CONFIG` has a working default - you don't need to
 touch it to get a first run going.
@@ -141,28 +140,21 @@ Inside `<folder>/vehicle_pipeline_output` (or wherever `--out-dir` points):
 
 - `vehicle_detection/` contains review thumbnails only. These images never
   feed plate detection or OCR.
-- `plate_detection/` contains crops made directly from the raw frame using
-  each plate detector box, with an 8-pixel default border.
-- `ocr/` contains the OCR result files. Names include the explicit per-frame
-  `track_id` and plate index.
+- `plate_detection/` contains plate crops detected and extracted inside each
+  saved vehicle crop, with an 8-pixel default border.
+- `ocr/` contains OCR result files for the image/folder workflow.
 - `pipeline_log.csv` contains one row per vehicle/plate result, including
   `track_id`, match method, containment, IoU, and orphan rows.
 
-RTSP output is written to the same date-based output folder. The current live
-mode processes sampled frames through the existing image pipeline; its
-per-frame IDs are not persistent tracker IDs, so duplicate-event suppression
-and temporal OCR confirmation should be added before production deployment.
+RTSP output is written to the same date-based output folder. RTSP uses
+Ultralytics tracking for persistent vehicle IDs, a latest-frame capture queue,
+and a separate bounded OCR queue. Plate detection/OCR is attempted at most
+three times per track and each track produces one final CSV row when accepted
+or when it disappears.
 
-The current project has no temporal tracker, so `track_id` is an explicit
-per-frame identifier (`<source timestamp>_vN`), not a persistent cross-frame
-tracker ID. A real tracker can replace that assignment without changing the
-plate matching contract.
-
-Both logical detector passes now run on the full raw frame. With the current
-single model this doubles detector calls per frame and can be a noticeable
-latency cost on CPU or edge hardware. A padded-crop-per-vehicle plate fallback
-could be exposed as an opt-in realtime mode, but it should remain a fallback
-because it recreates the scale/context mismatch this pipeline is fixing.
+The vehicle detector runs on the source frame, then the dedicated plate
+detector runs on each vehicle crop. This multi-level flow reduces the plate
+search area and keeps vehicle and plate model responsibilities separate.
 
 ---
 
