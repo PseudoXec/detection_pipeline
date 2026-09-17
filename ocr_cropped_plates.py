@@ -7,6 +7,8 @@ from paddleocr import PaddleOCR
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 MIN_HEIGHT = 64  # upscale anything shorter than this
+PLATE_TEXT_MIN_LENGTH = 6  # coarse post-processing guard for obviously broken OCR reads
+PLATE_TEXT_MIN_LENGTH = 6  # coarse post-processing guard for obviously broken OCR reads
 
 
 # --------------------------------------------------------------------------
@@ -89,6 +91,49 @@ def preprocess_for_ocr(image_path: str, min_height: int = MIN_HEIGHT):
 # --------------------------------------------------------------------------
 # Filename helpers
 # --------------------------------------------------------------------------
+def validate_plate_text(ocr_text: str, min_len: int = PLATE_TEXT_MIN_LENGTH) -> bool:
+    """Coarsely validate OCR text as an English alphanumeric plate.
+
+    This a coarse length-based filter, not a full Philippine plate regex. It
+    strips everything except A-Z and 0-9 before measuring length so separators,
+    spaces, dashes, punctuation, and non-Latin symbols do not count toward the
+    threshold. The goal is to fail closed on obvious OCR garbage such as stray
+    symbols or 1-2 character fragments.
+    """
+    if ocr_text is None or not isinstance(ocr_text, str):
+        return False
+
+    cleaned = "".join(ch for ch in ocr_text.upper() if ch.isascii() and (ch.isalpha() or ch.isdigit()))
+    if not cleaned:
+        return False
+    if len(cleaned) < min_len:
+        return False
+    return True
+
+
+def clean_plate_text(ocr_text: str) -> str:
+    """Strip OCR text down to a safe alphanumeric plate string.
+
+    This is post-processing only: it removes separators and non-Latin/symbol
+    noise, uppercases the result, and rejects obviously broken reads with a
+    coarse length-based validation. It is not a full format/regex validator and
+    should remain intentionally conservative until a future revision adds
+    format-specific checks.
+    """
+    if ocr_text is None or not isinstance(ocr_text, str):
+        return "UNRECOGNIZED"
+
+    cleaned = "".join(ch for ch in ocr_text.upper() if ch.isascii() and (ch.isalpha() or ch.isdigit()))
+    if not validate_plate_text(cleaned, min_len=PLATE_TEXT_MIN_LENGTH):
+        return "UNRECOGNIZED"
+    return cleaned
+
+
+def is_valid_plate_text(text: str) -> bool:
+    """Backward-compatible wrapper around validate_plate_text()."""
+    return validate_plate_text(text, min_len=PLATE_TEXT_MIN_LENGTH)
+
+
 def sanitize_for_filename(text: str, fallback: str = "unrecognized") -> str:
     """
     Turns recognized OCR text into something safe to use as a filename:
@@ -277,7 +322,8 @@ def main():
             text, conf, winning_variant = read_plate_text_best(ocr_engine, variants)
 
         low_confidence = conf < args.min_confidence
-        status = "check" if (low_confidence or not text) else "read"
+        recognized = is_valid_plate_text(text)
+        status = "check" if (low_confidence or not recognized) else "read"
 
         new_filename = original_filename
         if not args.no_rename:

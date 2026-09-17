@@ -6,7 +6,9 @@ Three files, one command:
   photos and crops out every detection.
 - `ocr_cropped_plates.py` - runs PaddleOCR on every crop and renames it to
   the recognized text.
-- `main.py` - runs both stages back to back. This is the only file you run.
+- `main.py` - runs vehicle and plate detection independently on the same raw
+  frame, matches plate boxes to vehicles, then runs OCR. This is the only file
+  you run.
 
 All three must live in the **same folder**.
 
@@ -54,10 +56,10 @@ Open `main.py` and edit the `CONFIG` dict near the top:
 
 | Key | What to set it to |
 |---|---|
-| `weights` | Path to your trained `.pt` file |
+| `vehicle_weights` | Path to your trained `vehicle.pt` file. It must contain both vehicle and plate classes. |
 | `folder` | Path to a folder of photos to process (leave `image` as `None`) |
 | `image` | Path to a single photo (leave `folder` as `None`) |
-| `classes` | Optional. If your model also detects things other than plates (car, person, face, etc.), set this to your plate class's exact name, e.g. `"license_plate"`, so only those get cropped/OCR'd. Leave as `None` to keep every detected class. |
+| `vehicle_classes` | Optional comma-separated vehicle class names, e.g. `"car,truck,bus"`. Plate detections are kept separately for matching. |
 
 Everything else in `CONFIG` has a working default - you don't need to
 touch it to get a first run going.
@@ -83,23 +85,35 @@ photo1_cropped_1_license_plate_92.jpg -> read (ABC1234)
 photo1_cropped_2_license_plate_61.jpg -> check (AB0122)
 ```
 
-`cropped` / `read` = looks good. `check` = worth a manual look (no
-detection, unreadable crop, or low OCR confidence).
+`no_plate` means a vehicle was detected without a matched plate. `orphan` is
+an emitted plate result with no vehicle match. `read` = looks good. `check` =
+worth a manual look (unreadable crop or low OCR confidence).
 
 ---
 
 ## 4. Where the results land
 
-Inside `<folder>/cropped_detections` (or wherever `--out-dir` points):
+Inside `<folder>/vehicle_pipeline_output` (or wherever `--out-dir` points):
 
-- Each crop, named `<original_photo>_cropped_<index>_<class>_<confidence>.jpg`
-- After OCR, renamed again to end in `_read_<TEXT>.jpg` or `_check_<TEXT>.jpg`
-- `ocr_scan_log.csv` - full detail for every file: exact confidence, which
-  preprocessing variant won, and a low-confidence flag
+- `vehicle_detection/` contains review thumbnails only. These images never
+  feed plate detection or OCR.
+- `plate_detection/` contains crops made directly from the raw frame using
+  each plate detector box, with an 8-pixel default border.
+- `ocr/` contains the OCR result files. Names include the explicit per-frame
+  `track_id` and plate index.
+- `pipeline_log.csv` contains one row per vehicle/plate result, including
+  `track_id`, match method, containment, IoU, and orphan rows.
 
-Because the filename always keeps the original photo's name plus the crop
-info, you can trace any final file straight back to the source photo just
-by reading its name - the CSV is there for the exact numbers.
+The current project has no temporal tracker, so `track_id` is an explicit
+per-frame identifier (`<source timestamp>_vN`), not a persistent cross-frame
+tracker ID. A real tracker can replace that assignment without changing the
+plate matching contract.
+
+Both logical detector passes now run on the full raw frame. With the current
+single model this doubles detector calls per frame and can be a noticeable
+latency cost on CPU or edge hardware. A padded-crop-per-vehicle plate fallback
+could be exposed as an opt-in realtime mode, but it should remain a fallback
+because it recreates the scale/context mismatch this pipeline is fixing.
 
 ---
 
