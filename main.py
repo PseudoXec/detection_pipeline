@@ -51,29 +51,22 @@ import ocr_cropped_plates as ocr
 CONFIG = {
     # --- Source: set exactly ONE of these, leave the other as None ---
     "image": None,                                  # e.g. r"C:\cars\photo.jpg"
-    "folder": r"data",
+    "folder": r"C:\Users\User\Documents\detection_pipeline\data",
 
     # --- Models ---
-    "vehicle_weights": r"models\vehicle_yolov11n.94mAP\weights\vehicle.pt",   # your trained vehicle .pt
-    "plate_weights": r"models/plate_yolov11n.95mAP/weights/platenum.pt",       # your trained plate .pt
+    "vehicle_weights": r"C:\Users\User\Documents\detection_pipeline\models\vehicle_yolov11n.94mAP\weights\vehicle.pt",   # your trained vehicle .pt
+    "plate_weights": r"C:\Users\User\Documents\detection_pipeline\models\plate_yolov11n.95mAP\weights\platenum.pt",       # your trained plate .pt
     "device": None,                                       # None = auto (GPU if available)
 
     # --- Vehicle detection stage ---
     "vehicle_classes": None,            # e.g. "car,truck,bus,motorcycle"; None = keep all classes
-    "vehicle_exclude_classes": "plate_number",  # e.g. class(es) baked into the vehicle model's
-                                         # training that you never want out of THIS stage (its
-                                         # built-in plate class, say) - dropped even if
-                                         # vehicle_classes is None. Comma-separated, exact match
-                                         # against the names your vehicle model reports (check
-                                         # vehicle_model.names to confirm spelling/case). None/""
-                                         # = don't drop anything extra.
     "vehicle_conf_threshold": 0.35,
     "vehicle_iou_threshold": 0.45,
-    "vehicle_crop_padding": 0.20,       # extra margin around each vehicle box (20%) - "a little bit larger"
+    "vehicle_crop_padding": 0.25,       # extra margin around each vehicle box (25%) - preserve the full vehicle
     "vehicle_crop_min_height": 200,     # zoom small vehicle crops up to at least this height (px)
 
     # --- Plate detection stage (runs on each vehicle crop) ---
-    "plate_conf_threshold": detect.DEFAULT_CONF_THRESHOLD,
+    "plate_conf_threshold": 0.40,       # small plates often score below 0.35 inside a vehicle crop
     "plate_iou_threshold": detect.DEFAULT_IOU_THRESHOLD,
     "plate_crop_padding": 0.15,
     "plate_crop_min_height": 120,
@@ -81,6 +74,7 @@ CONFIG = {
     # --- Shared image-processing (applied before BOTH detection passes) ---
     "no_preprocess": False,             # True = skip CLAHE/denoise/resize before detection
     "imgsz": None,                      # None = model's own default
+    "plate_imgsz": 1280,                # give the small plate model more pixels to work with
     "max_dim": detect.DEFAULT_MAX_DIM,
     "min_dim": detect.DEFAULT_MIN_DIM,
 
@@ -163,26 +157,44 @@ def crop_with_padding(
     return crop
 
 
+def rescale_predictions(
+    predictions: List[Dict[str, Any]], source_image, target_image,
+) -> List[Dict[str, Any]]:
+    """Maps pixel-coordinate detections from source_image to target_image."""
+    source_height, source_width = source_image.shape[:2]
+    target_height, target_width = target_image.shape[:2]
+    scale_x = target_width / source_width
+    scale_y = target_height / source_height
+
+    mapped = []
+    for prediction in predictions:
+        mapped_prediction = dict(prediction)
+        mapped_prediction["x"] = prediction["x"] * scale_x
+        mapped_prediction["y"] = prediction["y"] * scale_y
+        mapped_prediction["width"] = prediction["width"] * scale_x
+        mapped_prediction["height"] = prediction["height"] * scale_y
+        mapped.append(mapped_prediction)
+    return mapped
+
+
 def run_ocr_on_plate_crops(
     ocr_engine, plate_paths: List[str], ocr_dir: str, args,
 ) -> List[Dict[str, Any]]:
-    """OCRs every plate crop and saves a renamed COPY into ocr_dir (the
-    original crop in plate_detection/ is left untouched). Returns one
-    result dict per plate crop."""
-    os.makedirs(ocr_dir, exist_ok=True)
+    """OCRs every plate crop and records the result without saving a copy.
+
+    The existing OCR filename is still generated and stored in the CSV so
+    each result keeps the same naming convention and traceability.
+    """
     results = []
 
     for plate_path in plate_paths:
-        variants = ocr.generate_ocr_variants(plate_path)
-        if not variants:
+        plate_image = cv2.imread(plate_path)
+        if plate_image is None:
             print(f"    [warn] unreadable plate crop: {plate_path}")
             continue
 
-        if args.single_pass:
-            text, conf = ocr.read_plate_text(ocr_engine, dict(variants)["full"])
-            winning_variant = "full"
-        else:
-            text, conf, winning_variant = ocr.read_plate_text_best(ocr_engine, variants)
+        text, conf = ocr.read_plate_text(ocr_engine, plate_image)
+        winning_variant = "raw"
 
         low_confidence = conf < args.min_confidence
         status = "check" if (low_confidence or not text) else "read"
@@ -192,7 +204,6 @@ def run_ocr_on_plate_crops(
         vehicle_stem = plate_stem.removesuffix("_crop")
         base_name = f"{vehicle_stem}_{sanitized_text}"
         dest_path = ocr.unique_destination(ocr_dir, base_name, ".png")
-        shutil.copy2(plate_path, dest_path)
 
         detail = text if text else "no text found"
         print(f"    plate -> {status} ({detail}, conf={conf:.2f})")
@@ -225,19 +236,11 @@ def process_single_image(
     """Runs the full 3-stage pipeline on one source photo. Returns the
     number of vehicles that were cropped."""
     filename = os.path.basename(image_path)
-    preprocess = not args.no_preprocess
-
-    # Stage 1a: image-process the full photo, then detect vehicles on it.
-    detection_input_path = detect.prepare_detection_input(
-        image_path, preprocess, work_dir, args.max_dim, args.min_dim,
-    )
+    # Stage 1a: detect vehicles directly on the original photo.
+    detection_input_path = image_path
     vehicle_classes = (
         set(c.strip() for c in args.vehicle_classes.split(",") if c.strip())
         if args.vehicle_classes else None
-    )
-    vehicle_exclude_classes = (
-        set(c.strip() for c in args.vehicle_exclude_classes.split(",") if c.strip())
-        if args.vehicle_exclude_classes else None
     )
 
     try:
@@ -248,13 +251,6 @@ def process_single_image(
     except (FileNotFoundError, detect.LocalInferenceError) as e:
         print(f"{filename} -> vehicle detection error: {e}")
         return 0
-
-    # Drop classes the vehicle model was trained on but that don't belong in
-    # THIS stage (its own built-in plate class, say) - done here rather than
-    # via --vehicle-classes so you don't have to enumerate every other class
-    # the model knows about just to exclude one.
-    if vehicle_exclude_classes:
-        vehicle_preds = [p for p in vehicle_preds if p.get("class") not in vehicle_exclude_classes]
 
     if not vehicle_preds:
         print(f"{filename} -> no vehicles detected")
@@ -301,14 +297,12 @@ def process_single_image(
             "ocr_file": "",
         }
 
-        # Stage 2: image-process the vehicle crop, then detect the plate on it.
-        plate_input_path = detect.prepare_detection_input(
-            vehicle_crop_path, preprocess, work_dir, args.max_dim, args.min_dim,
-        )
+        # Stage 2: detect the plate directly on the original vehicle crop.
+        plate_input_path = vehicle_crop_path
         try:
             plate_preds = detect.run_local_detection(
                 plate_model, plate_input_path, args.plate_conf_threshold,
-                args.plate_iou_threshold, args.imgsz, None,
+                args.plate_iou_threshold, args.plate_imgsz, None,
             )
         except (FileNotFoundError, detect.LocalInferenceError) as e:
             print(f"  {vehicle_name} -> plate detection error: {e}")
@@ -322,10 +316,21 @@ def process_single_image(
             agg_rows.append(base_row)
             continue
 
+        # Detection may use a resized/denoised image, but save the plate from
+        # the original vehicle crop so preprocessing does not soften it.
+        detection_img = cv2.imread(plate_input_path)
+        vehicle_img = cv2.imread(vehicle_crop_path)
+        if detection_img is None or vehicle_img is None:
+            print(f"  {vehicle_name} -> could not reload plate crop source")
+            base_row["ocr_status"] = "plate_crop_source_error"
+            agg_rows.append(base_row)
+            continue
+        plate_preds = rescale_predictions(plate_preds, detection_img, vehicle_img)
+
         # Plate crops for the whole day also land flat in plate_dir, prefixed
         # with vehicle_name so each one still traces back to its vehicle/image.
         plate_paths = detect.crop_and_save_detections(
-            plate_input_path, plate_preds, plate_dir, vehicle_name,
+            vehicle_crop_path, plate_preds, plate_dir, vehicle_name,
             args.plate_crop_padding, args.plate_crop_min_height,
             output_extension=".png", simple_name=True,
         )
@@ -359,12 +364,10 @@ def process_single_image(
 def write_aggregate_log(date_dir: str, agg_rows: List[Dict[str, Any]]) -> str:
     output_path = os.path.join(date_dir, "pipeline_log.csv")
     fieldnames = [
-        "source_image", "vehicle_id", "vehicle_class", "vehicle_confidence",
-        "vehicle_crop", "plate_crop", "plate_text", "plate_confidence",
-        "ocr_status", "ocr_file",
+        "source_image", "vehicle_id", "vehicle_class", "ocr_status",
     ]
     with open(output_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(agg_rows)
     return output_path
@@ -387,11 +390,6 @@ def main():
     parser.add_argument("--vehicle-classes", default=CONFIG["vehicle_classes"],
                          help="Comma-separated vehicle class names to keep, e.g. 'car,truck,bus'. "
                               "Default: keep every class the vehicle model detects.")
-    parser.add_argument("--vehicle-exclude-classes", default=CONFIG["vehicle_exclude_classes"],
-                         help="Comma-separated class names to drop from the vehicle detection "
-                              "stage even though the vehicle model was trained to detect them "
-                              "(e.g. its own built-in 'plate_number' class). Applied after "
-                              "--vehicle-classes. Default: 'plate_number'.")
     parser.add_argument("--vehicle-conf-threshold", type=float, default=CONFIG["vehicle_conf_threshold"])
     parser.add_argument("--vehicle-iou-threshold", type=float, default=CONFIG["vehicle_iou_threshold"])
     parser.add_argument("--vehicle-crop-padding", type=float, default=CONFIG["vehicle_crop_padding"],
@@ -408,6 +406,7 @@ def main():
     parser.add_argument("--no-preprocess", action="store_true", default=CONFIG["no_preprocess"],
                          help="Skip CLAHE/denoise/resize before both detection passes.")
     parser.add_argument("--imgsz", type=int, default=CONFIG["imgsz"])
+    parser.add_argument("--plate-imgsz", type=int, default=CONFIG["plate_imgsz"])
     parser.add_argument("--max-dim", type=int, default=CONFIG["max_dim"])
     parser.add_argument("--min-dim", type=int, default=CONFIG["min_dim"])
 
@@ -443,7 +442,6 @@ def main():
     ocr_dir = os.path.join(date_dir, "ocr")
     os.makedirs(vehicle_dir, exist_ok=True)
     os.makedirs(plate_dir, exist_ok=True)
-    os.makedirs(ocr_dir, exist_ok=True)
     print(f"[info] Output folder for this run: {date_dir}")
 
     print("[info] Loading vehicle detection model...")
