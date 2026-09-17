@@ -54,8 +54,8 @@ CONFIG = {
     "folder": r"C:\Users\User\Documents\detection_pipeline\data",
 
     # --- Models ---
-    "vehicle_weights": r"C:\Users\User\Documents\detection_pipeline\models\vehicle_yolov11n.94mAP\weights\vehicle.pt",   # your trained vehicle .pt
-    "plate_weights": r"C:\Users\User\Documents\detection_pipeline\models\plate_yolov11n.95mAP\weights\platenum.pt",       # your trained plate .pt
+    "vehicle_weights": r"C:\Users\User\Documents\detection_pipeline\models\vehicle.pt",   # your trained vehicle .pt
+    "plate_weights": r"C:\Users\User\Documents\detection_pipeline\models\platenum.pt",       # your trained plate .pt
     "device": None,                                       # None = auto (GPU if available)
 
     # --- Vehicle detection stage ---
