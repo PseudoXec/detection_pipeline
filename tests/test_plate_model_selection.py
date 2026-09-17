@@ -129,6 +129,18 @@ class PlateModelSelectionTest(unittest.TestCase):
         self.assertEqual(capture.read_count, 3)
         self.assertTrue(capture.released)
 
+    def test_stream_tracks_reuse_id_for_overlapping_vehicle(self):
+        tracker = {"tracks": {}, "next_track_number": 1}
+        first = {"x": 50, "y": 50, "width": 40, "height": 40, "confidence": 0.9}
+        second = {"x": 52, "y": 51, "width": 40, "height": 40, "confidence": 0.9}
+
+        main.update_stream_tracks([first], tracker)
+        main.update_stream_tracks([second], tracker)
+
+        self.assertEqual(first["track_id"], "stream_v1")
+        self.assertEqual(second["track_id"], "stream_v1")
+        self.assertEqual(tracker["next_track_number"], 2)
+
 
 if __name__ == "__main__":
     unittest.main()

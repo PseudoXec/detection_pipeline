@@ -1,5 +1,6 @@
 import argparse
 import csv
+import math
 import os
 import shutil
 import sys
@@ -19,14 +20,17 @@ CONFIG = {
     "image": None,                                  # e.g. r"C:\cars\photo.jpg"
     "folder": None,                                 # e.g. r"C:\cars\sample_images"
     "rtsp_url": r"rtsp://admin:Victoria2313*@192.168.100.229:554/stream1",                            # e.g. r"rtsp://user:password@camera/stream"
-    "stream_frame_skip": 20,                         # process one frame every N captured frames
+    "stream_frame_skip": 2,                          # process one frame every N captured frames
     "stream_width": 1280,                           # requested RTSP capture width
     "stream_height": 720,                           # requested RTSP capture height
     "stream_fps": 3,                               # requested RTSP capture FPS
     "stream_buffer_size": 1,                        # keep only the newest buffered frame
     "stream_reconnect_delay": 5.0,                  # seconds between reconnect attempts
-    "stream_max_frames": 5,                         # 0 = run until stopped; useful for testing
+    "stream_max_frames": 0,                         # 0 = run until stopped; useful for testing
     "stream_preview": True,                         # show live detection window for RTSP input
+    "stream_track_iou_threshold": 0.3,              # minimum IoU to keep a vehicle track
+    "stream_track_max_center_distance": 2.0,         # max center movement in vehicle-widths
+    "stream_track_max_missing": 10,                 # processed frames before a track expires
 
     # --- Models ---
     "vehicle_weights": r"C:\Users\User\Documents\detection_pipeline\models\vehicle.pt",   # your trained vehicle .pt
@@ -169,6 +173,58 @@ def is_plate_prediction(prediction: Dict[str, Any]) -> bool:
     if normalized in {"lp", "licenseplate", "licenceplate", "numberplate", "platenumber"}:
         return True
     return any(marker in normalized for marker in ("plate", "license", "licence", "registration"))
+
+def update_stream_tracks(
+    vehicle_predictions: List[Dict[str, Any]],
+    tracker: Dict[str, Any],
+    iou_threshold: float = 0.3,
+    max_center_distance: float = 2.0,
+    max_missing: int = 10,
+) -> None:
+    """Assign stable IDs to vehicle boxes across sampled stream frames."""
+    tracks = tracker.setdefault("tracks", {})
+    used_track_ids: Set[str] = set()
+    next_track_number = int(tracker.get("next_track_number", 1))
+
+    for prediction in sorted(vehicle_predictions, key=lambda item: item.get("confidence", 0.0), reverse=True):
+        best_track_id = None
+        best_iou = iou_threshold
+        best_center_distance = max_center_distance
+        for track_id, track in tracks.items():
+            if track_id in used_track_ids:
+                continue
+            overlap = compute_iou(prediction, track["box"])
+            previous_box = track["box"]
+            center_distance = math.hypot(
+                prediction["x"] - previous_box["x"],
+                prediction["y"] - previous_box["y"],
+            ) / max(previous_box["width"], previous_box["height"], 1.0)
+            if overlap >= best_iou or (
+                overlap > 0.0 and center_distance <= best_center_distance
+            ):
+                if overlap < best_iou and center_distance > best_center_distance:
+                    continue
+                best_iou = overlap
+                best_center_distance = center_distance
+                best_track_id = track_id
+
+        if best_track_id is None:
+            best_track_id = f"stream_v{next_track_number}"
+            next_track_number += 1
+            tracks[best_track_id] = {"box": prediction, "missing": 0}
+        else:
+            tracks[best_track_id]["box"] = prediction
+            tracks[best_track_id]["missing"] = 0
+        prediction["track_id"] = best_track_id
+        used_track_ids.add(best_track_id)
+
+    for track_id in list(tracks):
+        if track_id not in used_track_ids:
+            tracks[track_id]["missing"] += 1
+            if tracks[track_id]["missing"] > max_missing:
+                del tracks[track_id]
+
+    tracker["next_track_number"] = next_track_number
 
 
 def _box_edges(box: Dict[str, Any]) -> Tuple[float, float, float, float]:
@@ -466,8 +522,18 @@ def process_single_image(
         pred for pred in plate_preds
         if is_plate_prediction(pred)
     ]
-    for vehicle_index, vehicle in enumerate(vehicle_preds, start=1):
-        vehicle["track_id"] = f"{timestamp}_v{vehicle_index}"
+    stream_tracker = getattr(args, "_stream_tracker", None)
+    if stream_tracker is not None:
+        update_stream_tracks(
+            vehicle_preds,
+            stream_tracker,
+            getattr(args, "stream_track_iou_threshold", 0.3),
+            getattr(args, "stream_track_max_center_distance", 2.0),
+            getattr(args, "stream_track_max_missing", 10),
+        )
+    else:
+        for vehicle_index, vehicle in enumerate(vehicle_preds, start=1):
+            vehicle["track_id"] = f"{timestamp}_v{vehicle_index}"
 
     full_img = cv2.imread(detection_input_path)
     if full_img is None:
@@ -664,6 +730,7 @@ def process_rtsp_stream(
     frame_number = 0
     processed_frames = 0
     total_vehicles = 0
+    args._stream_tracker = {"tracks": {}, "next_track_number": 1}
 
     try:
         while max_frames == 0 or processed_frames < max_frames:
@@ -713,6 +780,8 @@ def process_rtsp_stream(
     except KeyboardInterrupt:
         print("\n[stream] Stopped by user")
     finally:
+        if hasattr(args, "_stream_tracker"):
+            del args._stream_tracker
         if capture is not None:
             capture.release()
         if getattr(args, "show_stream_preview", False):
@@ -779,6 +848,15 @@ def main():
                          help="Requested RTSP FPS; the camera may ignore this value.")
     parser.add_argument("--stream-buffer-size", type=int, default=CONFIG["stream_buffer_size"],
                          help="Capture buffer size; 1 minimizes live-feed delay.")
+    parser.add_argument("--stream-track-iou-threshold", type=float,
+                         default=CONFIG["stream_track_iou_threshold"],
+                         help="Minimum box overlap used to keep a vehicle's RTSP track.")
+    parser.add_argument("--stream-track-max-center-distance", type=float,
+                         default=CONFIG["stream_track_max_center_distance"],
+                         help="Maximum center movement in previous vehicle-widths.")
+    parser.add_argument("--stream-track-max-missing", type=int,
+                         default=CONFIG["stream_track_max_missing"],
+                         help="Processed RTSP frames a track may disappear before expiring.")
     parser.add_argument("--stream-reconnect-delay", type=float,
                          default=CONFIG["stream_reconnect_delay"],
                          help="Seconds to wait before reconnecting after an RTSP failure.")
@@ -819,6 +897,12 @@ def main():
         sys.exit("Error: stream width, height, and FPS cannot be negative.")
     if args.stream_buffer_size < 1:
         sys.exit("Error: --stream-buffer-size must be at least 1.")
+    if not 0.0 <= args.stream_track_iou_threshold <= 1.0:
+        sys.exit("Error: --stream-track-iou-threshold must be between 0 and 1.")
+    if args.stream_track_max_center_distance < 0:
+        sys.exit("Error: --stream-track-max-center-distance cannot be negative.")
+    if args.stream_track_max_missing < 0:
+        sys.exit("Error: --stream-track-max-missing cannot be negative.")
     if args.stream_max_frames < 0:
         sys.exit("Error: --stream-max-frames cannot be negative.")
     base_out_dir = args.out_dir or default_base_out_dir(args.image, args.folder, args.rtsp_url)
