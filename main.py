@@ -6,6 +6,7 @@ import shutil
 import sys
 import tempfile
 import time
+import threading
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -28,6 +29,8 @@ CONFIG = {
     "stream_reconnect_delay": 5.0,                  # seconds between reconnect attempts
     "stream_max_frames": 0,                         # 0 = run until stopped; useful for testing
     "stream_preview": True,                         # show live detection window for RTSP input
+    "stream_preview_width": 1280,                   # preview window width
+    "stream_preview_height": 720,                   # preview window height
     "stream_track_iou_threshold": 0.3,              # minimum IoU to keep a vehicle track
     "stream_track_max_center_distance": 2.0,         # max center movement in vehicle-widths
     "stream_track_max_missing": 10,                 # processed frames before a track expires
@@ -722,48 +725,65 @@ def process_rtsp_stream(
     agg_rows: List[Dict[str, Any]],
     capture_factory: Any = cv2.VideoCapture,
 ) -> int:
-    """Read an RTSP feed and send selected frames through the image pipeline."""
+    """Read the newest RTSP frame and send selected frames through the pipeline."""
     frame_skip = max(1, int(args.stream_frame_skip))
     reconnect_delay = max(0.0, float(args.stream_reconnect_delay))
     max_frames = max(0, int(args.stream_max_frames))
-    capture = None
-    frame_number = 0
+    capture = capture_factory(rtsp_url)
+    if not capture.isOpened():
+        capture.release()
+        raise RuntimeError(f"Could not open RTSP stream: {rtsp_url}")
+
+    latest_frame: Dict[str, Any] = {"value": None, "number": 0}
+    frame_lock = threading.Lock()
+    stop_reader = threading.Event()
+    reader_failed = threading.Event()
+
+    def read_latest_frames() -> None:
+        while not stop_reader.is_set():
+            ok, frame = capture.read()
+            if not ok or frame is None:
+                print("[stream] Frame read failed; stopping capture reader")
+                reader_failed.set()
+                stop_reader.set()
+                return
+            with frame_lock:
+                latest_frame["value"] = frame
+                latest_frame["number"] += 1
+
+    capture.set(cv2.CAP_PROP_FRAME_WIDTH, max(0, int(getattr(args, "stream_width", 1280))))
+    capture.set(cv2.CAP_PROP_FRAME_HEIGHT, max(0, int(getattr(args, "stream_height", 720))))
+    capture.set(cv2.CAP_PROP_FPS, max(0, int(getattr(args, "stream_fps", 15))))
+    capture.set(cv2.CAP_PROP_BUFFERSIZE, max(1, int(getattr(args, "stream_buffer_size", 1))))
+    reader = threading.Thread(target=read_latest_frames, daemon=True)
+    reader.start()
     processed_frames = 0
     total_vehicles = 0
     args._stream_tracker = {"tracks": {}, "next_track_number": 1}
+    last_processed_frame = 0
+
+    if getattr(args, "show_stream_preview", False):
+        cv2.namedWindow("RTSP detection preview", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(
+            "RTSP detection preview",
+            max(320, int(getattr(args, "stream_preview_width", 1280))),
+            max(240, int(getattr(args, "stream_preview_height", 720))),
+        )
 
     try:
         while max_frames == 0 or processed_frames < max_frames:
-            if capture is None or not capture.isOpened():
-                if capture is not None:
-                    capture.release()
-                print(f"[stream] Connecting to {rtsp_url}")
-                capture = capture_factory(rtsp_url)
-                capture.set(cv2.CAP_PROP_FRAME_WIDTH, max(0, int(getattr(args, "stream_width", 1280))))
-                capture.set(cv2.CAP_PROP_FRAME_HEIGHT, max(0, int(getattr(args, "stream_height", 720))))
-                capture.set(cv2.CAP_PROP_FPS, max(0, int(getattr(args, "stream_fps", 15))))
-                capture.set(cv2.CAP_PROP_BUFFERSIZE, max(1, int(getattr(args, "stream_buffer_size", 1))))
-                if not capture.isOpened():
-                    print(f"[stream] Connection failed; retrying in {reconnect_delay:g}s")
-                    capture.release()
-                    capture = None
-                    if reconnect_delay:
-                        time.sleep(reconnect_delay)
-                    continue
-                print("[stream] Connected")
-
-            ok, frame = capture.read()
-            if not ok or frame is None:
-                print(f"[stream] Frame read failed; reconnecting in {reconnect_delay:g}s")
-                capture.release()
-                capture = None
-                if reconnect_delay:
-                    time.sleep(reconnect_delay)
+            if reader_failed.is_set():
+                break
+            with frame_lock:
+                frame = latest_frame["value"]
+                frame_number = latest_frame["number"]
+            if frame is None or frame_number == last_processed_frame:
+                time.sleep(0.01)
                 continue
-
-            frame_number += 1
             if (frame_number - 1) % frame_skip != 0:
+                last_processed_frame = frame_number
                 continue
+            last_processed_frame = frame_number
 
             frame_name = datetime.now().strftime("stream_%Y%m%d_%H%M%S_%f.jpg")
             frame_path = os.path.join(work_dir, frame_name)
@@ -782,8 +802,8 @@ def process_rtsp_stream(
     finally:
         if hasattr(args, "_stream_tracker"):
             del args._stream_tracker
-        if capture is not None:
-            capture.release()
+        stop_reader.set()
+        capture.release()
         if getattr(args, "show_stream_preview", False):
             cv2.destroyAllWindows()
 
