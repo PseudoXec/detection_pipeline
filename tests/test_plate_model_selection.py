@@ -119,7 +119,8 @@ class PlateModelSelectionTest(unittest.TestCase):
             return 1
 
         with patch.object(main.cv2, "imwrite", return_value=True), \
-             patch.object(main, "process_single_image", side_effect=fake_process_single_image):
+               patch.object(main, "process_single_image", side_effect=fake_process_single_image), \
+               patch.object(main.detect, "run_local_tracking", return_value=[]):
             total = main.process_rtsp_stream(
                 "rtsp://camera/stream", args, object(), object(), object(),
                 "out", "out/vehicle", "out/plate", "out/ocr", tempfile.gettempdir(), [],

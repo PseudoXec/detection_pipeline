@@ -26,6 +26,7 @@ import tempfile
 from typing import Any, Dict, List, Optional, Set
 
 import cv2
+import numpy as np
 from ultralytics import YOLO
 
 # --------------------------------------------------------------------------
@@ -193,6 +194,64 @@ def run_local_detection(
             "confidence": float(conf),
         })
 
+    return predictions
+
+
+def run_local_tracking(
+    model: YOLO,
+    frame: np.ndarray,
+    conf_threshold: float = DEFAULT_CONF_THRESHOLD,
+    iou_threshold: float = DEFAULT_IOU_THRESHOLD,
+    imgsz: Optional[int] = None,
+    classes: Optional[Set[str]] = None,
+    tracker: str = "bytetrack.yaml",
+) -> List[Dict[str, Any]]:
+    """Run persistent Ultralytics tracking on one in-memory video frame."""
+    track_kwargs: Dict[str, Any] = dict(
+        source=frame,
+        conf=conf_threshold,
+        iou=iou_threshold,
+        tracker=tracker,
+        persist=True,
+        verbose=False,
+    )
+    if imgsz:
+        track_kwargs["imgsz"] = imgsz
+
+    try:
+        results = model.track(**track_kwargs)
+    except Exception as e:  # noqa: BLE001 - surface as our own error type
+        raise LocalInferenceError(f"Local model tracking failed: {e}") from e
+
+    if not results:
+        return []
+    result = results[0]
+    boxes = result.boxes
+    if boxes is None or len(boxes) == 0:
+        return []
+
+    names = result.names
+    xywh = boxes.xywh.cpu().numpy()
+    confs = boxes.conf.cpu().numpy()
+    cls_idxs = boxes.cls.cpu().numpy().astype(int)
+    track_ids = boxes.id.int().cpu().tolist() if boxes.id is not None else [None] * len(xywh)
+
+    predictions: List[Dict[str, Any]] = []
+    for (cx, cy, bw, bh), conf, cls_idx, track_id in zip(xywh, confs, cls_idxs, track_ids):
+        cls_name = names.get(int(cls_idx), str(cls_idx)) if isinstance(names, dict) else str(cls_idx)
+        if classes and cls_name not in classes:
+            continue
+        prediction = {
+            "x": float(cx),
+            "y": float(cy),
+            "width": float(bw),
+            "height": float(bh),
+            "class": cls_name,
+            "confidence": float(conf),
+        }
+        if track_id is not None:
+            prediction["track_id"] = f"stream_v{int(track_id)}"
+        predictions.append(prediction)
     return predictions
 
 

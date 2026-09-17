@@ -2,6 +2,7 @@ import argparse
 import csv
 import math
 import os
+import queue
 import shutil
 import sys
 import tempfile
@@ -20,11 +21,11 @@ CONFIG = {
     # --- Source: set exactly ONE of these, leave the other as None ---
     "image": None,                                  # e.g. r"C:\cars\photo.jpg"
     "folder": None,                                 # e.g. r"C:\cars\sample_images"
-    "rtsp_url": r"rtsp://admin:Victoria2313*@192.168.100.229:554/stream1",                            # e.g. r"rtsp://user:password@camera/stream"
-    "stream_frame_skip": 2,                          # process one frame every N captured frames
-    "stream_width": 1280,                           # requested RTSP capture width
-    "stream_height": 720,                           # requested RTSP capture height
-    "stream_fps": 3,                               # requested RTSP capture FPS
+    "rtsp_url": r"rtsp://admin:Victoria2313*@192.168.100.229:554/stream1",                          
+    "stream_frame_skip": 1,                         # process one frame every N captured frames
+    "stream_width": 1920,                           # requested RTSP capture width
+    "stream_height": 1080,                          # requested RTSP capture height
+    "stream_fps": 15,                               # requested RTSP capture FPS
     "stream_buffer_size": 1,                        # keep only the newest buffered frame
     "stream_reconnect_delay": 5.0,                  # seconds between reconnect attempts
     "stream_max_frames": 0,                         # 0 = run until stopped; useful for testing
@@ -505,10 +506,14 @@ def process_single_image(
     )
 
     try:
-        vehicle_preds = detect.run_local_detection(
-            vehicle_model, detection_input_path, args.vehicle_conf_threshold,
-            args.vehicle_iou_threshold, args.imgsz, vehicle_classes,
-        )
+        tracked_vehicle_preds = getattr(args, "_stream_vehicle_predictions", None)
+        if tracked_vehicle_preds is None:
+            vehicle_preds = detect.run_local_detection(
+                vehicle_model, detection_input_path, args.vehicle_conf_threshold,
+                args.vehicle_iou_threshold, args.imgsz, vehicle_classes,
+            )
+        else:
+            vehicle_preds = [dict(prediction) for prediction in tracked_vehicle_preds]
         plate_preds = detect.run_local_detection(
             plate_model, detection_input_path, args.plate_conf_threshold,
             args.vehicle_iou_threshold, args.imgsz, None,
@@ -526,7 +531,9 @@ def process_single_image(
         if is_plate_prediction(pred)
     ]
     stream_tracker = getattr(args, "_stream_tracker", None)
-    if stream_tracker is not None:
+    if tracked_vehicle_preds is not None and any("track_id" in pred for pred in vehicle_preds):
+        pass
+    elif stream_tracker is not None:
         update_stream_tracks(
             vehicle_preds,
             stream_tracker,
@@ -684,11 +691,11 @@ def process_single_image(
         })
         agg_rows.append(row)
 
-    if getattr(args, "show_stream_preview", False):
-        preview = draw_detection_preview(full_img, vehicle_preds, plate_preds)
-        cv2.imshow("RTSP detection preview", preview)
-        if cv2.waitKey(1) & 0xFF == ord("q"):
-            raise KeyboardInterrupt
+    preview_state = getattr(args, "_stream_preview_state", None)
+    if preview_state is not None:
+        with preview_state["lock"]:
+            preview_state["vehicle_predictions"] = [dict(prediction) for prediction in vehicle_preds]
+            preview_state["plate_predictions"] = [dict(prediction) for prediction in plate_preds]
 
     return vehicle_count
 
@@ -738,6 +745,7 @@ def process_rtsp_stream(
     frame_lock = threading.Lock()
     stop_reader = threading.Event()
     reader_failed = threading.Event()
+    stop_preview = threading.Event()
 
     def read_latest_frames() -> None:
         while not stop_reader.is_set():
@@ -757,10 +765,16 @@ def process_rtsp_stream(
     capture.set(cv2.CAP_PROP_BUFFERSIZE, max(1, int(getattr(args, "stream_buffer_size", 1))))
     reader = threading.Thread(target=read_latest_frames, daemon=True)
     reader.start()
-    processed_frames = 0
-    total_vehicles = 0
     args._stream_tracker = {"tracks": {}, "next_track_number": 1}
-    last_processed_frame = 0
+    preview_state = {
+        "lock": threading.Lock(),
+        "vehicle_predictions": [],
+        "plate_predictions": [],
+    }
+    args._stream_preview_state = preview_state
+    inference_queue: queue.Queue = queue.Queue(maxsize=1)
+    worker_stop = threading.Event()
+    worker_state = {"processed_frames": 0, "total_vehicles": 0}
 
     if getattr(args, "show_stream_preview", False):
         cv2.namedWindow("RTSP detection preview", cv2.WINDOW_NORMAL)
@@ -770,44 +784,97 @@ def process_rtsp_stream(
             max(240, int(getattr(args, "stream_preview_height", 720))),
         )
 
+    def run_inference_worker() -> None:
+        while not worker_stop.is_set():
+            try:
+                frame_path, frame_number, inference_frame = inference_queue.get(timeout=0.05)
+            except queue.Empty:
+                continue
+            try:
+                args._stream_vehicle_predictions = detect.run_local_tracking(
+                    vehicle_model,
+                    inference_frame,
+                    getattr(args, "vehicle_conf_threshold", 0.35),
+                    getattr(args, "vehicle_iou_threshold", 0.45),
+                    getattr(args, "imgsz", None),
+                    set(c.strip() for c in args.vehicle_classes.split(",") if c.strip())
+                    if getattr(args, "vehicle_classes", None) else None,
+                )
+                worker_state["total_vehicles"] += process_single_image(
+                    frame_path, args, vehicle_model, plate_model, ocr_engine,
+                    date_dir, vehicle_dir, plate_dir, ocr_dir, work_dir, agg_rows,
+                )
+                worker_state["processed_frames"] += 1
+                print(f"[stream] Processed frame {worker_state['processed_frames']} (captured {frame_number})")
+            except (FileNotFoundError, detect.LocalInferenceError) as error:
+                print(f"[stream] Inference error on frame {frame_number}: {error}")
+            finally:
+                if hasattr(args, "_stream_vehicle_predictions"):
+                    del args._stream_vehicle_predictions
+                inference_queue.task_done()
+
+    inference_worker = threading.Thread(target=run_inference_worker, daemon=True)
+    inference_worker.start()
+    last_submitted_frame = 0
+
     try:
-        while max_frames == 0 or processed_frames < max_frames:
-            if reader_failed.is_set():
+        while max_frames == 0 or worker_state["processed_frames"] < max_frames:
+            if stop_preview.is_set():
                 break
             with frame_lock:
                 frame = latest_frame["value"]
                 frame_number = latest_frame["number"]
-            if frame is None or frame_number == last_processed_frame:
+
+            if reader_failed.is_set() and (frame is None or frame_number == last_submitted_frame):
+                break
+
+            if frame is not None and getattr(args, "show_stream_preview", False):
+                with preview_state["lock"]:
+                    vehicle_predictions = preview_state["vehicle_predictions"]
+                    plate_predictions = preview_state["plate_predictions"]
+                preview = draw_detection_preview(frame, vehicle_predictions, plate_predictions)
+                cv2.imshow("RTSP detection preview", preview)
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    stop_preview.set()
+                    stop_reader.set()
+                    break
+
+            if frame is None or frame_number == last_submitted_frame:
                 time.sleep(0.01)
                 continue
             if (frame_number - 1) % frame_skip != 0:
-                last_processed_frame = frame_number
+                last_submitted_frame = frame_number
                 continue
-            last_processed_frame = frame_number
+            if not inference_queue.empty():
+                time.sleep(0.005)
+                continue
 
             frame_name = datetime.now().strftime("stream_%Y%m%d_%H%M%S_%f.jpg")
             frame_path = os.path.join(work_dir, frame_name)
             if not cv2.imwrite(frame_path, frame):
                 print(f"[stream] Could not stage frame {frame_number}")
+                last_submitted_frame = frame_number
                 continue
-
-            total_vehicles += process_single_image(
-                frame_path, args, vehicle_model, plate_model, ocr_engine,
-                date_dir, vehicle_dir, plate_dir, ocr_dir, work_dir, agg_rows,
-            )
-            processed_frames += 1
-            print(f"[stream] Processed frame {processed_frames} (captured {frame_number})")
+            inference_queue.put((frame_path, frame_number, frame.copy()))
+            last_submitted_frame = frame_number
     except KeyboardInterrupt:
         print("\n[stream] Stopped by user")
     finally:
+        stop_preview.set()
+        inference_queue.join()
+        worker_stop.set()
+        inference_worker.join(timeout=2.0)
         if hasattr(args, "_stream_tracker"):
             del args._stream_tracker
+        if hasattr(args, "_stream_preview_state"):
+            del args._stream_preview_state
+        stop_preview.set()
         stop_reader.set()
         capture.release()
         if getattr(args, "show_stream_preview", False):
             cv2.destroyAllWindows()
 
-    return total_vehicles
+    return worker_state["total_vehicles"]
 
 
 def main():
