@@ -1,0 +1,13 @@
+# Core detection stack
+ultralytics
+opencv-python
+numpy
+
+# Configuration file parsing (config.yaml)
+pyyaml
+
+# NOTE for Raspberry Pi 5 deployments:
+# opencv-python's prebuilt wheel is large and sometimes slow to install on
+# ARM boards. If pip struggles, use opencv-python-headless instead (no GUI
+# bindings needed for a 24/7 headless service anyway):
+#   pip install opencv-python-headless

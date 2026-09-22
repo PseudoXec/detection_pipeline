@@ -1,0 +1,47 @@
+# config.yaml
+# -----------
+# Every setting here has a matching default in config.py. You only need to
+# list the values you actually want to change - anything left out keeps its
+# default. This file is what you edit on the Raspberry Pi in production;
+# you should not need to touch the .py files to run day-to-day.
+
+camera:
+  # set this to your camera's RTSP URL for 24/7 live operation
+  rtsp_url: "rtsp://admin:password@192.168.1.50:554/stream1"
+  frame_width: 1280
+  frame_height: 720
+  capture_buffer_size: 1          # 1 = always the newest frame, never a stale queued one
+  decode_threads: 2               # cores reserved for FFmpeg's software H.264 decode
+  reconnect_delay_seconds: 5.0
+  max_reconnect_attempts: 0       # 0 = retry forever (correct for 24/7 use)
+
+roi:
+  x_min: 0.15
+  x_max: 0.85
+  y_min: 0.15
+  y_max: 0.90
+
+model:
+  vehicle_weights: "models/vehicle_openvino_model"
+  plate_weights: "models/platenum_closeup_openvino_model"
+  device: null                    # null = auto; OpenVINO folders ignore this anyway
+  imgsz: 640
+  vehicle_conf_threshold: 0.35
+  plate_conf_threshold: 0.35
+  vehicle_classes: null           # e.g. "car,truck,bus,motorcycle"; null = accept all
+
+tracking:
+  dedup_cooldown_seconds: 2.0     # don't re-log a vehicle sitting still for this long
+  max_plate_attempts: 3           # give up looking for a plate after this many tries
+
+storage:
+  database_path: "data/pipeline_buffer.db"   # SQLite buffer read by the C# dashboard
+  save_images_to_disk: true                  # also keep a JPEG copy under output/
+  output_dir: "output"
+  jpeg_quality: 90
+  retention_days: 14                         # auto-delete synced rows older than this
+
+runtime:
+  log_level: "INFO"
+  show_preview: false             # keep OFF on a headless Raspberry Pi
+  max_frames: 0                   # 0 = run forever
