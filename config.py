@@ -98,8 +98,15 @@ class ModelConfig:
     # None = let ultralytics choose (CPU on a Pi, GPU if one is present)
     device: Optional[str] = None
 
-    # inference image size fed to both models
-    imgsz: int = 640
+    # inference image size fed to EACH model. These are separate because a
+    # static-shape OpenVINO export is compiled for exactly one input size -
+    # if you exported vehicle.pt at --imgsz 480 (a common choice: the vehicle
+    # model scans the whole frame, so a smaller size = faster), it will ONLY
+    # accept 480x480 input. Feeding it 640x640 here throws a shape-mismatch
+    # error from OpenVINO. These numbers MUST match whatever --imgsz you
+    # used in export_openvino.py for each model.
+    vehicle_imgsz: int = 480
+    plate_imgsz: int = 640
 
     # confidence / NMS thresholds per stage
     vehicle_conf_threshold: float = 0.35
@@ -149,11 +156,25 @@ class CropConfig:
 
 @dataclass
 class PreprocessConfig:
-    """Optional image enhancement steps."""
+    """Optional image enhancement steps.
 
-    # sharpen/denoise the vehicle crop before running plate detection on it
+    These exist to help the plate model find small/low-contrast plates, but
+    they are NOT free: CLAHE contrast boosting + sharpening can also
+    introduce artifacts (halos, exaggerated noise, blown-out highlights)
+    that make some models detect WORSE, not better - this depends heavily
+    on how the model itself was trained. If you notice accuracy drop after
+    enabling either flag below, turn it off; the model then sees the raw
+    camera crop untouched.
+    """
+
+    # sharpen/denoise the vehicle crop before running plate detection on it.
+    # Turn this OFF first if plate-detection accuracy looks worse than
+    # expected - this is the step most likely to hurt a model that was
+    # trained on plain, un-enhanced crops.
     enhance_before_plate_detect: bool = True
-    # sharpen/denoise/upscale the final plate crop before saving it
+    # sharpen/denoise/upscale the final plate crop before saving it.
+    # This one only affects what gets SAVED/stored, not detection itself,
+    # so it's safe to leave on even if you turn the flag above off.
     enhance_plate_crop: bool = True
     plate_crop_min_height: int = 64
 

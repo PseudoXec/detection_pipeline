@@ -79,8 +79,8 @@ class DetectionPipeline:
     def warmup(self, frame_shape: Optional[tuple] = None) -> None:
         """Run one throwaway inference per model before the real loop starts."""
         print("[pipeline] warming up models...")
-        detector.warmup_model(self.vehicle_model, self.config.model.imgsz, frame_shape)
-        detector.warmup_model(self.plate_model, self.config.model.imgsz)
+        detector.warmup_model(self.vehicle_model, self.config.model.vehicle_imgsz, frame_shape)
+        detector.warmup_model(self.plate_model, self.config.model.plate_imgsz)
 
     # ------------------------------------------------------------------ #
     # Stage 1: Vehicle Detect (+ tracking)
@@ -91,7 +91,7 @@ class DetectionPipeline:
         vehicle_predictions = detector.track(
             self.vehicle_model, frame,
             model_cfg.vehicle_conf_threshold, model_cfg.vehicle_iou_threshold,
-            model_cfg.imgsz, tracking_cfg.bytetrack_config, self.vehicle_classes,
+            model_cfg.vehicle_imgsz, tracking_cfg.bytetrack_config, self.vehicle_classes,
         )
 
         # ByteTrack occasionally can't assign an ID (e.g. right after a
@@ -173,7 +173,7 @@ class DetectionPipeline:
         try:
             batch_results = detector.detect_batch(
                 self.plate_model, crops,
-                model_cfg.plate_conf_threshold, model_cfg.vehicle_iou_threshold, model_cfg.imgsz,
+                model_cfg.plate_conf_threshold, model_cfg.vehicle_iou_threshold, model_cfg.plate_imgsz,
             )
         except detector.InferenceError as error:
             print(f"[pipeline] plate detection error: {error}")

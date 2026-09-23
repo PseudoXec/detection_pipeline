@@ -6,6 +6,14 @@ numpy
 # Configuration file parsing (config.yaml)
 pyyaml
 
+# Ultralytics otherwise auto-installs these two the FIRST time you run the
+# pipeline (you'll see "attempting AutoUpdate... Downloading openvino" in the
+# console) which makes that first run slower and needs internet access at
+# that moment. Listing them here means `pip install -r requirements.txt`
+# gets them up front, once, during setup instead.
+openvino>=2024.0.0   # runs the exported *_openvino_model folders
+lap>=0.5.12          # required by ByteTrack (the tracker used in tracker.py)
+
 # NOTE for Raspberry Pi 5 deployments:
 # opencv-python's prebuilt wheel is large and sometimes slow to install on
 # ARM boards. If pip struggles, use opencv-python-headless instead (no GUI

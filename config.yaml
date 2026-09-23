@@ -7,7 +7,7 @@
 
 camera:
   # set this to your camera's RTSP URL for 24/7 live operation
-  rtsp_url: "rtsp://admin:password@192.168.1.50:554/stream1"
+  rtsp_url: "rtsp://admin:Victoria2313*@192.168.100.229:554/stream1"
   frame_width: 1280
   frame_height: 720
   capture_buffer_size: 1          # 1 = always the newest frame, never a stale queued one
@@ -25,7 +25,8 @@ model:
   vehicle_weights: "models/vehicle_openvino_model"
   plate_weights: "models/platenum_closeup_openvino_model"
   device: null                    # null = auto; OpenVINO folders ignore this anyway
-  imgsz: 640
+  vehicle_imgsz: 480               # must match the size vehicle.pt was exported at
+  plate_imgsz: 640                 # must match the size platenum_closeup.pt was exported at
   vehicle_conf_threshold: 0.35
   plate_conf_threshold: 0.35
   vehicle_classes: null           # e.g. "car,truck,bus,motorcycle"; null = accept all
@@ -33,6 +34,16 @@ model:
 tracking:
   dedup_cooldown_seconds: 2.0     # don't re-log a vehicle sitting still for this long
   max_plate_attempts: 3           # give up looking for a plate after this many tries
+
+preprocess:
+  # CLAHE contrast + sharpen on the vehicle crop BEFORE plate detection runs.
+  # This is the setting most likely to affect detection accuracy - if plates
+  # are being missed or misdetected, try setting this to false first so the
+  # model sees the raw, untouched crop.
+  enhance_before_plate_detect: true
+  # CLAHE contrast + sharpen + upscale on the final plate crop before saving.
+  # Only affects the saved/stored image, not detection - safe to leave on.
+  enhance_plate_crop: true
 
 storage:
   database_path: "data/pipeline_buffer.db"   # SQLite buffer read by the C# dashboard

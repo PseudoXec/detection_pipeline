@@ -161,7 +161,7 @@ functions they were exercising still exist, just split across smaller files.
 
 ---
 
-## 8. Speeding things up further
+## 8. Speeding things up further / re-exporting models
 
 `export_openvino.py` converts a `.pt` checkpoint into an OpenVINO export,
 which runs noticeably faster on the Pi 5's CPU:
@@ -170,3 +170,11 @@ python export_openvino.py --weights models/vehicle.pt --imgsz 480 --benchmark --
 ```
 Point `config.yaml`'s `model.vehicle_weights` / `model.plate_weights` at the
 resulting folder.
+
+**Important:** a static-shape OpenVINO export only accepts exactly the size
+it was exported at - feed it anything else and inference throws a shape-
+mismatch error. If you re-export a model at a different `--imgsz`, update
+`model.vehicle_imgsz` / `model.plate_imgsz` in `config.yaml` to match, or the
+pipeline will crash on the first real frame. The two shipped models in
+`models/` were exported at 480 (vehicle) and 640 (plate), which is why those
+are the config defaults.
