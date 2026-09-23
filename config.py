@@ -156,6 +156,7 @@ class CropConfig:
 
 @dataclass
 class PreprocessConfig:
+<<<<<<< HEAD
     """Non-toggle tuning values for image enhancement steps.
 
     Whether these steps RUN AT ALL is controlled centrally in
@@ -163,6 +164,28 @@ class PreprocessConfig:
     - this section only holds the numeric knobs for them.
     """
 
+=======
+    """Optional image enhancement steps.
+
+    These exist to help the plate model find small/low-contrast plates, but
+    they are NOT free: CLAHE contrast boosting + sharpening can also
+    introduce artifacts (halos, exaggerated noise, blown-out highlights)
+    that make some models detect WORSE, not better - this depends heavily
+    on how the model itself was trained. If you notice accuracy drop after
+    enabling either flag below, turn it off; the model then sees the raw
+    camera crop untouched.
+    """
+
+    # sharpen/denoise the vehicle crop before running plate detection on it.
+    # Turn this OFF first if plate-detection accuracy looks worse than
+    # expected - this is the step most likely to hurt a model that was
+    # trained on plain, un-enhanced crops.
+    enhance_before_plate_detect: bool = True
+    # sharpen/denoise/upscale the final plate crop before saving it.
+    # This one only affects what gets SAVED/stored, not detection itself,
+    # so it's safe to leave on even if you turn the flag above off.
+    enhance_plate_crop: bool = True
+>>>>>>> a61824a5fd18bc7aa7dc05598005c6342096ad5e
     plate_crop_min_height: int = 64
 
 

@@ -36,7 +36,18 @@ tracking:
   max_plate_attempts: 3           # give up looking for a plate after this many tries
 
 preprocess:
+<<<<<<< HEAD
   plate_crop_min_height: 64       # whether enhancement RUNS is under features: below
+=======
+  # CLAHE contrast + sharpen on the vehicle crop BEFORE plate detection runs.
+  # This is the setting most likely to affect detection accuracy - if plates
+  # are being missed or misdetected, try setting this to false first so the
+  # model sees the raw, untouched crop.
+  enhance_before_plate_detect: true
+  # CLAHE contrast + sharpen + upscale on the final plate crop before saving.
+  # Only affects the saved/stored image, not detection - safe to leave on.
+  enhance_plate_crop: true
+>>>>>>> a61824a5fd18bc7aa7dc05598005c6342096ad5e
 
 storage:
   database_path: "data/pipeline_buffer.db"   # SQLite buffer read by the C# dashboard

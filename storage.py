@@ -233,9 +233,15 @@ class DetectionStorage:
                         vehicle_image, vehicle_box_x1, vehicle_box_y1, vehicle_box_x2, vehicle_box_y2,
                         plate_detected, plate_confidence, plate_image,
                         plate_box_x1, plate_box_y1, plate_box_x2, plate_box_y2,
+<<<<<<< HEAD
                         detected_at, vehicle_detect_ms, vehicle_crop_ms, plate_detect_ms, plate_crop_ms,
                         total_pipeline_ms
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+=======
+                        detected_at, vehicle_crop_ms, plate_detect_ms, plate_crop_ms,
+                        total_pipeline_ms
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+>>>>>>> a61824a5fd18bc7aa7dc05598005c6342096ad5e
                     """,
                     rows,
                 )
