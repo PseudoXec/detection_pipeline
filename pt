@@ -1,0 +1,5 @@
+
+input ms on vehicle detect + vehicle cropt , plate detect + plate crop then total on the print on cmd and on the sqllite
+make it all centralized so i can just true or false if it is needed
+all sql columns 
+all features all on a on or  off
