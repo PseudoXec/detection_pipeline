@@ -24,6 +24,8 @@ thread gets to flush whatever is still queued.
 import argparse
 # logging gives us leveled, timestamped console output (works well with journald on a Pi)
 import logging
+# os._exit is the force-quit escape hatch if a second Ctrl+C is needed
+import os
 # signal lets us catch Ctrl+C and `systemctl stop` and shut down cleanly
 import signal
 # sys.exit is used for fatal startup errors (bad path, can't open camera, etc.)
@@ -97,10 +99,20 @@ def run_on_stream(pipeline: DetectionPipeline, config: PipelineConfig) -> None:
     pipeline.warmup(frame_shape=(config.camera.frame_height, config.camera.frame_width))
 
     stop_event = threading.Event()
+    shutdown_requests = 0
 
     def handle_shutdown(signum, _frame):
-        log.info("received signal %s - shutting down...", signum)
-        stop_event.set()
+        nonlocal shutdown_requests
+        shutdown_requests += 1
+        if shutdown_requests == 1:
+            log.info("received signal %s - shutting down... (press Ctrl+C again to force-quit immediately)", signum)
+            stop_event.set()
+        else:
+            # something (an OpenCV/NCNN native call holding the GIL, a stuck
+            # RTSP read, etc.) is preventing a clean shutdown - don't make
+            # the user kill the terminal window, just die right now
+            log.info("second interrupt received - forcing immediate exit")
+            os._exit(1)
 
     # SIGINT = Ctrl+C, SIGTERM = what systemd sends on `systemctl stop`
     signal.signal(signal.SIGINT, handle_shutdown)
@@ -109,6 +121,11 @@ def run_on_stream(pipeline: DetectionPipeline, config: PipelineConfig) -> None:
     last_processed_frame_number = -1
     frames_processed = 0
     max_frames = config.runtime.max_frames
+    # heartbeat so silence never means "is this even alive?" again
+    heartbeat_interval_seconds = 15.0
+    last_heartbeat = time.time()
+    last_heartbeat_frame_count = 0
+    waited_for_first_frame = False
 
     log.info("pipeline running - press Ctrl+C to stop")
     try:
@@ -117,8 +134,12 @@ def run_on_stream(pipeline: DetectionPipeline, config: PipelineConfig) -> None:
 
             # nothing decoded yet (e.g. still connecting) - wait a beat and retry
             if captured is None:
+                if not waited_for_first_frame and time.time() - last_heartbeat > 5.0:
+                    log.info("still waiting on the first frame from the camera...")
+                    last_heartbeat = time.time()
                 time.sleep(0.05)
                 continue
+            waited_for_first_frame = True
 
             # never re-process a frame we've already handled; this is what
             # lets the pipeline naturally skip frames when inference is
@@ -132,6 +153,15 @@ def run_on_stream(pipeline: DetectionPipeline, config: PipelineConfig) -> None:
             pipeline.process_frame(captured.image)
             frames_processed += 1
 
+            if time.time() - last_heartbeat >= heartbeat_interval_seconds:
+                new_frames = frames_processed - last_heartbeat_frame_count
+                log.info(
+                    "heartbeat: %d frame(s) processed in the last %.0fs (%d total) - still running",
+                    new_frames, heartbeat_interval_seconds, frames_processed,
+                )
+                last_heartbeat = time.time()
+                last_heartbeat_frame_count = frames_processed
+
             if config.features.show_preview:
                 cv2.imshow("pipeline preview", captured.image)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
@@ -140,6 +170,11 @@ def run_on_stream(pipeline: DetectionPipeline, config: PipelineConfig) -> None:
             if max_frames and frames_processed >= max_frames:
                 log.info("reached configured max_frames=%d - stopping", max_frames)
                 break
+    except KeyboardInterrupt:
+        # backstop in case the SIGINT handler above didn't fire (has
+        # happened on some Windows/terminal combinations) - default Python
+        # behavior still raises this in the main thread on Ctrl+C
+        log.info("KeyboardInterrupt caught directly - shutting down...")
     finally:
         camera.stop()
         if config.features.show_preview:

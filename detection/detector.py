@@ -35,24 +35,31 @@ def is_openvino_export(path: str) -> bool:
     return os.path.isdir(path) and any(name.endswith(".xml") for name in os.listdir(path))
 
 
+def is_ncnn_export(path: str) -> bool:
+    """True if `path` is a folder containing an exported NCNN model (.ncnn.param + .ncnn.bin)."""
+    return os.path.isdir(path) and any(name.endswith(".ncnn.param") for name in os.listdir(path))
+
+
 def weights_exist(path: str) -> bool:
-    """True if `path` points at either a .pt file or an OpenVINO export folder."""
-    return os.path.isfile(path) or is_openvino_export(path)
+    """True if `path` points at a .pt file, an OpenVINO export folder, or an NCNN export folder."""
+    return os.path.isfile(path) or is_openvino_export(path) or is_ncnn_export(path)
 
 
 def load_model(weights_path: str, device: Optional[str] = None) -> YOLO:
-    """Load a YOLO model, whether it's a raw .pt checkpoint or an OpenVINO export.
+    """Load a YOLO model, whether it's a raw .pt checkpoint, an OpenVINO
+    export, or an NCNN export.
 
-    OpenVINO exports run noticeably faster on CPU-only hardware like a
-    Raspberry Pi - see export_openvino.py to create one from a .pt file.
+    NCNN exports run noticeably faster on CPU-only hardware like a
+    Raspberry Pi - see export_ncnn.py / the *_ncnn_model folders under
+    models/ (exported via `YOLO(...).export(format="ncnn")`).
     """
     # fail loudly and early with a clear message if the path is wrong,
     # instead of letting Ultralytics raise a confusing internal error later
     if not weights_exist(weights_path):
         raise FileNotFoundError(
             f"Model weights not found at: {weights_path}\n"
-            f"Point config.model.vehicle_weights / plate_weights at a .pt file "
-            f"or an exported *_openvino_model folder."
+            f"Point config.model.vehicle_weights / plate_weights at a .pt file, "
+            f"an exported *_openvino_model folder, or an exported *_ncnn_model folder."
         )
 
     if os.path.isfile(weights_path):
@@ -61,7 +68,7 @@ def load_model(weights_path: str, device: Optional[str] = None) -> YOLO:
         if device:
             model.to(device)
     else:
-        # OpenVINO exports are CPU-optimized and ignore the `device` setting
+        # OpenVINO/NCNN exports are CPU-optimized and ignore the `device` setting
         model = YOLO(weights_path, task="detect")
 
     return model

@@ -68,6 +68,8 @@ class DetectionRecord:
     plate_detect_ms: Optional[float]
     plate_crop_ms: Optional[float]
     total_pipeline_ms: Optional[float]   # sum of whichever stages above were measured
+    ocr_process: bool                    # True if an OCR read was attempted on the plate crop
+    ocr_read: str                        # recognized plate text, or "Unrecognized" if it couldn't be read
 
 
 # the exact table layout the C# dashboard will read from
@@ -96,6 +98,8 @@ CREATE TABLE IF NOT EXISTS detections (
     plate_detect_ms     REAL,
     plate_crop_ms       REAL,
     total_pipeline_ms   REAL,                   -- headline "vehicle to plate crop" latency
+    ocr_process          INTEGER NOT NULL DEFAULT 0,  -- 0 or 1: was an OCR read attempted
+    ocr_read             TEXT,                  -- recognized plate text, or "Unrecognized"
     synced              INTEGER NOT NULL DEFAULT 0,  -- set to 1 by the consuming dashboard
     created_at          TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -154,6 +158,10 @@ class DetectionStorage:
         existing = {row[1] for row in connection.execute("PRAGMA table_info(detections)")}
         if "vehicle_detect_ms" not in existing:
             connection.execute("ALTER TABLE detections ADD COLUMN vehicle_detect_ms REAL")
+        if "ocr_process" not in existing:
+            connection.execute("ALTER TABLE detections ADD COLUMN ocr_process INTEGER NOT NULL DEFAULT 0")
+        if "ocr_read" not in existing:
+            connection.execute("ALTER TABLE detections ADD COLUMN ocr_read TEXT")
 
     def _connect(self) -> sqlite3.Connection:
         """Open a new SQLite connection tuned for a single-writer/many-reader setup."""
@@ -221,8 +229,8 @@ class DetectionStorage:
                             plate_detected, plate_confidence, plate_image,
                             plate_box_x1, plate_box_y1, plate_box_x2, plate_box_y2,
                             detected_at, vehicle_detect_ms, vehicle_crop_ms, plate_detect_ms, plate_crop_ms,
-                            total_pipeline_ms
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            total_pipeline_ms, ocr_process, ocr_read
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             record.track_id, record.camera_source, record.vehicle_class,
@@ -233,6 +241,7 @@ class DetectionStorage:
                             record.detected_at.isoformat(sep=" ", timespec="seconds"),
                             record.vehicle_detect_ms, record.vehicle_crop_ms,
                             record.plate_detect_ms, record.plate_crop_ms, record.total_pipeline_ms,
+                            1 if record.ocr_process else 0, record.ocr_read,
                         ),
                     )
                     inserted_ids.append(cursor.lastrowid)

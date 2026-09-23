@@ -96,6 +96,9 @@ class ThreadedRTSPCamera:
         """
         try:
             self._open_capture()
+            # silence used to mean "either it's fine or it's dead" with no
+            # way to tell which - so say so explicitly the moment we connect
+            print(f"[camera] connected to {self.rtsp_url}")
         except RuntimeError as error:
             print(f"[camera] {error}")
             print(f"[camera] retrying every {self.reconnect_delay_seconds:.0f}s until the camera is reachable...")

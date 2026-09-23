@@ -23,6 +23,14 @@ from typing import Any, Dict, List, Optional
 # shared box-math helpers live in geometry.py so both trackers use identical math
 from detection.geometry import compute_iou, center_distance_in_widths
 
+# minimum box overlap required before two detections separated in time are
+# treated as "the same physical vehicle" for position-dedup purposes. Pure
+# distance isn't enough because a fixed-lane ROI means EVERY vehicle passes
+# through roughly the same screen position - IoU is what actually tells two
+# different vehicles in the same spot apart from one vehicle that briefly
+# lost tracking.
+_DEDUP_MIN_IOU = 0.5
+
 
 def needs_fallback_tracker(vehicle_predictions: List[Dict[str, Any]]) -> bool:
     """True when ByteTrack did NOT manage to tag every detection with a track_id."""
@@ -115,6 +123,12 @@ class PositionDeduper:
             # only compare vehicles of the same class (a car parking where a
             # truck just left shouldn't be treated as the same vehicle)
             if box.get("class") and entry.get("class") and box["class"] != entry["class"]:
+                continue
+            # require real box overlap in ADDITION to closeness - two
+            # different vehicles passing through the same lane spot rarely
+            # overlap this much, but a re-detected same vehicle almost
+            # always does
+            if compute_iou(box, entry) < _DEDUP_MIN_IOU:
                 continue
             distance = center_distance_in_widths(box, entry)
             if distance < best_distance:

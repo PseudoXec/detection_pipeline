@@ -20,3 +20,6 @@ lap>=0.5.12          # required by ByteTrack (the tracker used in tracker.py)
 # bindings needed for a 24/7 headless service anyway):
 #   pip install opencv-python-headless
 requests>=2.31.0
+
+# Inline plate-text OCR used by ocr/plate_reader.py (features.ocr_read: true)
+paddleocr

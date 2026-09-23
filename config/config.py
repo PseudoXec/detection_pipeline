@@ -93,20 +93,20 @@ class ModelConfig:
     """Where the two YOLO models live and how they run."""
 
     # folder or .pt file for the vehicle detector
-    vehicle_weights: str = str(PROJECT_ROOT / "models" / "vehicle_openvino_model")
+    vehicle_weights: str = str(PROJECT_ROOT / "models" / "vehicle_ncnn_model")
     # folder or .pt file for the plate detector
-    plate_weights: str = str(PROJECT_ROOT / "models" / "platenum_closeup_openvino_model")
+    plate_weights: str = str(PROJECT_ROOT / "models" / "platenum_closeup_ncnn_model")
 
     # None = let ultralytics choose (CPU on a Pi, GPU if one is present)
     device: Optional[str] = None
 
     # inference image size fed to EACH model. These are separate because a
-    # static-shape OpenVINO export is compiled for exactly one input size -
+    # static-shape NCNN export is compiled for exactly one input size -
     # if you exported vehicle.pt at --imgsz 480 (a common choice: the vehicle
     # model scans the whole frame, so a smaller size = faster), it will ONLY
     # accept 480x480 input. Feeding it 640x640 here throws a shape-mismatch
-    # error from OpenVINO. These numbers MUST match whatever --imgsz you
-    # used in export_openvino.py for each model.
+    # error from NCNN. These numbers MUST match whatever --imgsz you used
+    # when exporting each model (see export_openvino.py / the ncnn export).
     vehicle_imgsz: int = 480
     plate_imgsz: int = 640
 
@@ -166,6 +166,23 @@ class PreprocessConfig:
     """
 
     plate_crop_min_height: int = 64
+
+
+@dataclass
+class OcrConfig:
+    """Settings for the inline plate-text OCR pass that runs right after a
+    plate crop is produced (see FeaturesConfig.ocr_read for the on/off
+    switch)."""
+
+    # language model PaddleOCR's recognizer loads
+    lang: str = "en"
+    # recognitions below this confidence are treated as unreadable -> "Unrecognized"
+    min_confidence: float = 0.5
+    # characters allowed in a cleaned-up plate read; anything else is stripped
+    allowed_chars: str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    # text used whenever a plate crop exists but OCR could not read it
+    # (crop too blurry/dark, recognizer errored, confidence too low, etc.)
+    unrecognized_text: str = "Unrecognized"
 
 
 @dataclass
@@ -239,6 +256,7 @@ class FeaturesConfig:
     plate_detection: bool = True                # run the plate model at all (False = vehicles only)
     enhance_before_plate_detect: bool = True     # CLAHE + sharpen the vehicle crop before plate detection
     enhance_plate_crop: bool = True              # CLAHE + sharpen + upscale the saved plate crop
+    ocr_read: bool = True                        # run OCR on a saved plate crop to read its text
     save_images_to_disk: bool = True             # also keep a JPEG copy under output/
     show_preview: bool = False                   # live OpenCV preview window (keep OFF on a headless Pi)
 
@@ -269,6 +287,7 @@ class FeaturesConfig:
     col_plate_detect_ms: bool = True
     col_plate_crop_ms: bool = True
     col_total_pipeline_ms: bool = True
+    col_ocr_read: bool = True
 
 
 @dataclass
@@ -281,6 +300,7 @@ class PipelineConfig:
     tracking: TrackingConfig = field(default_factory=TrackingConfig)
     crop: CropConfig = field(default_factory=CropConfig)
     preprocess: PreprocessConfig = field(default_factory=PreprocessConfig)
+    ocr: OcrConfig = field(default_factory=OcrConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     features: FeaturesConfig = field(default_factory=FeaturesConfig)

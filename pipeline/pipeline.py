@@ -32,6 +32,7 @@ from detection.geometry import crop_vehicle, crop_plate, is_inside_roi, compute_
 from storage.storage import DetectionStorage, DetectionRecord
 from pipeline.timing import VehicleTiming, Stopwatch
 from detection.tracker import FallbackTracker, PositionDeduper, needs_fallback_tracker
+from ocr import PlateOCRReader
 
 
 class DetectionPipeline:
@@ -59,6 +60,18 @@ class DetectionPipeline:
         self.deduper = PositionDeduper(
             cooldown_seconds=config.tracking.dedup_cooldown_seconds,
             position_threshold=config.tracking.dedup_position_threshold,
+        )
+
+        # lazy-loaded inline OCR reader - only pays the PaddleOCR import/load
+        # cost if features.ocr_read is on and a plate is actually found
+        self.ocr_reader = (
+            PlateOCRReader(
+                lang=config.ocr.lang,
+                min_confidence=config.ocr.min_confidence,
+                allowed_chars=config.ocr.allowed_chars,
+            )
+            if config.features.ocr_read
+            else None
         )
 
         # per-track_id bookkeeping so we never re-save a crop we already have,
@@ -227,6 +240,12 @@ class DetectionPipeline:
         plate_x2: Optional[float] = None
         plate_y2: Optional[float] = None
 
+        # OCR metadata - defaults cover "no plate ever found for this
+        # vehicle" (attempts_exhausted with no plate_predictions at all):
+        # no OCR pass was possible, so the read is unrecognized by definition
+        ocr_process = False
+        ocr_read = self.config.ocr.unrecognized_text
+
         if plate_predictions:
             best_plate = max(plate_predictions, key=lambda p: p.get("confidence", 0.0))
             # raw detection box edges, in the vehicle crop's own pixel space -
@@ -244,10 +263,30 @@ class DetectionPipeline:
                 plate_detected = True
                 if features.save_images_to_disk:
                     self._write_crop_to_disk("plate_detection", f"{track_id}_plate", plate_crop)
+
+                # a plate crop exists - attempt an OCR read on it. Any failure
+                # (OCR disabled, engine unavailable, low confidence, no text
+                # found) falls back to the configured "Unrecognized" text,
+                # it never blocks or crashes the finalize step.
+                ocr_process = True
+                ocr_text = None
+                if self.ocr_reader is not None:
+                    try:
+                        ocr_text = self.ocr_reader.read(plate_crop)
+                    except Exception as error:
+                        if features.print_console:
+                            print(f"[pipeline] {track_id} OCR read failed: {error}")
+                        ocr_text = None
+                ocr_read = ocr_text if ocr_text else self.config.ocr.unrecognized_text
             else:
                 # detection fired but the crop itself failed (degenerate box) -
                 # don't report box coordinates for a plate we didn't actually save
                 plate_x1 = plate_y1 = plate_x2 = plate_y2 = None
+                # a plate box existed but we couldn't produce a crop to OCR -
+                # still "attempted" in the sense that a plate was detected,
+                # but there was nothing to read
+                ocr_process = True
+                ocr_read = self.config.ocr.unrecognized_text
 
         # vehicle box edges, in the ORIGINAL FULL FRAME's pixel space - what's
         # needed to draw this vehicle's box back onto the full camera frame
@@ -276,6 +315,8 @@ class DetectionPipeline:
             plate_detect_ms=timing.plate_detect_ms if features.col_plate_detect_ms else None,
             plate_crop_ms=timing.plate_crop_ms if features.col_plate_crop_ms else None,
             total_pipeline_ms=timing.total_ms if features.col_total_pipeline_ms else None,
+            ocr_process=ocr_process if features.col_ocr_read else False,
+            ocr_read=ocr_read if features.col_ocr_read else self.config.ocr.unrecognized_text,
         )
 
         if features.store_to_sqlite:
@@ -283,7 +324,10 @@ class DetectionPipeline:
         self._finalized_tracks.add(track_id)
 
         if features.print_console:
-            status = f"plate found ({plate_confidence:.2f})" if plate_detected else "no plate found"
+            if plate_detected:
+                status = f"plate found ({plate_confidence:.2f}) - ocr: {ocr_read}"
+            else:
+                status = "no plate found"
             if features.print_timing:
                 breakdown = (
                     f"vehicle_detect={self._fmt_ms(timing.vehicle_detect_ms)} "

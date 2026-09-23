@@ -16,17 +16,17 @@ camera:
   max_reconnect_attempts: 0       # 0 = retry forever (correct for 24/7 use)
 
 roi:
-  x_min: 0.15
-  x_max: 0.85
-  y_min: 0.15
-  y_max: 0.90
+  x_min: 0.20
+  x_max: 0.80
+  y_min: 0.20
+  y_max: 0.80
 
 model:
-  vehicle_weights: "models/vehicle_openvino_model"
-  plate_weights: "models/platenum_closeup_openvino_model"
-  device: null                    # null = auto; OpenVINO folders ignore this anyway
-  vehicle_imgsz: 480               # must match the size vehicle.pt was exported at
-  plate_imgsz: 640                 # must match the size platenum_closeup.pt was exported at
+  vehicle_weights: "models/vehicle.onnx"
+  plate_weights: "models/platenum_closeup.onnx"
+  device: null                    # null = auto; CPU-only unless onnxruntime-gpu is installed
+  vehicle_imgsz: 1280              # MUST match the static shape baked into vehicle.onnx (1280x1280)
+  plate_imgsz: 640                 # matches the static shape baked into platenum_closeup.onnx (640x640)
   vehicle_conf_threshold: 0.35
   plate_conf_threshold: 0.35
   vehicle_classes: null           # e.g. "car,truck,bus,motorcycle"; null = accept all
@@ -37,6 +37,11 @@ tracking:
 
 preprocess:
   plate_crop_min_height: 64       # whether enhancement RUNS is under features: below
+
+ocr:
+  lang: "en"
+  min_confidence: 0.5              # reads below this confidence become "Unrecognized"
+  unrecognized_text: "Unrecognized"
 
 storage:
   database_path: "data/pipeline_buffer.db"   # SQLite buffer read by the C# dashboard
@@ -67,6 +72,7 @@ features:
   plate_detection: true               # run the plate model at all (false = log vehicles only)
   enhance_before_plate_detect: true   # CLAHE + sharpen the vehicle crop before plate detection
   enhance_plate_crop: true            # CLAHE + sharpen + upscale the saved plate crop
+  ocr_read: true                      # read plate text with OCR right after a plate crop is saved
   save_images_to_disk: true           # also keep a JPEG copy of every crop under output/
   show_preview: false                 # live OpenCV preview window - keep OFF on a headless Pi
 
@@ -97,6 +103,7 @@ features:
   col_plate_detect_ms: true
   col_plate_crop_ms: true
   col_total_pipeline_ms: true
+  col_ocr_read: true
 
 # ---------------------------------------------------------------------------
 # api - placeholder until the C# dev provides the real endpoint
