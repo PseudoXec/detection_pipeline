@@ -94,6 +94,12 @@ def run_on_stream(pipeline: DetectionPipeline, config: PipelineConfig) -> None:
         max_reconnect_attempts=config.camera.max_reconnect_attempts,
     ).start()
 
+    # live view: frames come straight from the camera thread (smooth video even
+    # when inference is slow), boxes come from the pipeline via publish()
+    if pipeline.live_server is not None:
+        pipeline.live_server.set_frame_source(camera.read_latest)
+        pipeline.live_server.start()
+
     # warm the models up using the real capture resolution so the very first
     # genuine frame isn't slowed down by lazy graph initialization
     pipeline.warmup(frame_shape=(config.camera.frame_height, config.camera.frame_width))
@@ -150,7 +156,7 @@ def run_on_stream(pipeline: DetectionPipeline, config: PipelineConfig) -> None:
                 continue
             last_processed_frame_number = captured.frame_number
 
-            pipeline.process_frame(captured.image)
+            pipeline.process_frame(captured.image, captured_at=captured.captured_at)
             frames_processed += 1
 
             if time.time() - last_heartbeat >= heartbeat_interval_seconds:
@@ -241,6 +247,7 @@ def main() -> None:
         else:
             sys.exit("No source configured - set camera.rtsp_url, camera.image, or camera.folder in config.yaml")
     finally:
+        pipeline.shutdown()
         # give the background writer thread a chance to flush anything queued
         log.info("flushing storage buffer before exit...")
         storage.stop()

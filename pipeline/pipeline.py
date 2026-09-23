@@ -33,6 +33,8 @@ from storage.storage import DetectionStorage, DetectionRecord
 from pipeline.timing import VehicleTiming, Stopwatch
 from detection.tracker import FallbackTracker, PositionDeduper, needs_fallback_tracker
 from ocr import PlateOCRReader
+from live.box_publisher import LiveBoxPublisher
+from live.live_server import LiveServer
 
 
 class DetectionPipeline:
@@ -73,6 +75,35 @@ class DetectionPipeline:
             if config.features.ocr_read
             else None
         )
+
+        # optional live box feed for the command center; fire-and-forget on its
+        # own thread, so a slow/dead server can never stall the detection loop
+        self.live_publisher: Optional[LiveBoxPublisher] = None
+        if config.features.live_boxes:
+            if config.live.endpoint_url:
+                self.live_publisher = LiveBoxPublisher(
+                    endpoint_url=config.live.endpoint_url,
+                    camera_id=config.live.camera_id,
+                    max_hz=config.live.max_hz,
+                    timeout_seconds=config.live.timeout_seconds,
+                ).start()
+            else:
+                print("[pipeline] features.live_boxes is on but live.endpoint_url is not set - live feed disabled")
+
+        # optional live VIEW served from the Pi (frames + boxes over HTTP). Only
+        # created here; run.py starts it once it has a camera to read frames from.
+        self.live_server: Optional[LiveServer] = None
+        if config.features.live_stream:
+            self.live_server = LiveServer(
+                camera_id=config.live.camera_id,
+                host=config.live.serve_host,
+                port=config.live.serve_port,
+                stream_fps=config.live.stream_fps,
+                stream_width=config.live.stream_width,
+                jpeg_quality=config.live.jpeg_quality,
+                box_max_age_seconds=config.live.box_max_age_seconds,
+                auth_token=config.live.auth_token,
+            )
 
         # per-track_id bookkeeping so we never re-save a crop we already have,
         # and so we know how many times we've tried (and failed) to find a plate
@@ -343,7 +374,14 @@ class DetectionPipeline:
     # ------------------------------------------------------------------ #
     # Public entry point: process ONE frame end to end
     # ------------------------------------------------------------------ #
-    def process_frame(self, frame: np.ndarray, always_finalize: bool = False) -> int:
+    def shutdown(self) -> None:
+        """Stop background helpers owned by the pipeline (live box push + live view server)."""
+        if self.live_publisher is not None:
+            self.live_publisher.stop()
+        if self.live_server is not None:
+            self.live_server.stop()
+
+    def process_frame(self, frame: np.ndarray, always_finalize: bool = False, captured_at: Optional[float] = None) -> int:
         """Runs the full Vehicle Detect -> Crop -> Plate Detect -> Crop flow
         for one frame. Returns how many NEW vehicles were cropped this call.
 
@@ -359,6 +397,9 @@ class DetectionPipeline:
         vehicle_predictions = self._detect_and_track_vehicles(frame)
         # Stage 1b: drop plate-labelled boxes and anything outside our ROI/size range
         vehicle_predictions = [p for p in vehicle_predictions if not self._looks_like_plate(p)]
+        # keep the pre-ROI list for the live feed: the operator should see
+        # vehicles approaching, flagged in_roi or not
+        all_tracked_vehicles = vehicle_predictions
         vehicle_predictions = self._filter_to_roi(vehicle_predictions, frame_shape)
 
         new_vehicle_count = 0
@@ -381,6 +422,14 @@ class DetectionPipeline:
             attempts_exhausted = attempts >= self.config.tracking.max_plate_attempts
             if not already_done and not attempts_exhausted:
                 track_ids_needing_plate.append(track_id)
+
+        # Live feed: publish NOW, before the (slower) plate model runs, so
+        # boxes go out at detector speed. By this point the dedup step has
+        # already remapped track_ids in place, so they match the DB rows.
+        in_roi_ids = {id(p) for p in vehicle_predictions}
+        for live_sink in (self.live_publisher, self.live_server):
+            if live_sink is not None:
+                live_sink.publish(frame_shape, all_tracked_vehicles, in_roi_ids, captured_at)
 
         # Stage 4: run the plate model, once, on every vehicle crop that needs it
         plate_results = self._run_plate_detection(track_ids_needing_plate)

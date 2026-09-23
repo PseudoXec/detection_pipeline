@@ -193,3 +193,28 @@ mismatch error. If you re-export a model at a different `--imgsz`, update
 pipeline will crash on the first real frame. The two shipped models in
 `models/` were exported at 480 (vehicle) and 640 (plate), which is why those
 are the config defaults.
+
+---
+
+## 9. Live view (frames + boxes for the command center)
+
+The dashboard endpoint is built on the `detections` columns: one row per
+*finished* vehicle, crops as base64. Video frames don't belong there (they are
+continuous and throw-away), so the Pi **serves** the live view and the
+dashboard **pulls** it. Turn it on with `features.live_stream: true`.
+
+| URL (default port 8090) | What you get |
+|---|---|
+| `/live/stream.mjpg` | MJPEG stream, boxes drawn in - opens in a browser or WebView2 `<img>` |
+| `/live/frame.jpg` | one JPEG - poll it (e.g. every 100 ms) from WPF |
+| `/live/boxes` | latest tracker boxes as JSON (`x1,y1,x2,y2` in full-frame pixels, `in_roi`, `track_id`) |
+| `/live/health` | `{"ok": true, ...}` liveness check |
+
+Add `?overlay=0` for the raw frame (draw your own boxes from `/live/boxes`).
+If `live.auth_token` is set, send `?token=...` or `Authorization: Bearer ...`.
+
+Frames come straight from the camera thread, so video stays smooth even when
+inference is slower than the camera. JPEG encoding only happens while someone
+is watching. `features.live_boxes` (push boxes to a server endpoint) still
+exists and is independent of this.
+

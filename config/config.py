@@ -235,6 +235,37 @@ class ApiConfig:
 
 
 @dataclass
+class LiveConfig:
+    """Live bounding-box feed for the command center (see live/box_publisher.py).
+
+    Two independent ways to get the live view to the command center:
+
+      * features.live_stream (RECOMMENDED) - the Pi SERVES frames + boxes over
+        HTTP and the dashboard pulls them (see live/live_server.py). Needs no
+        endpoint on the server side.
+      * features.live_boxes - the Pi PUSHES boxes (JSON only, no frames) to
+        `endpoint_url` (see live/box_publisher.py). Needs a server endpoint.
+    """
+
+    # -- shared --
+    camera_id: str = "cam1"                 # short, credential-free name for this camera
+
+    # -- push mode (features.live_boxes) --
+    endpoint_url: Optional[str] = None      # e.g. "http://server:8000/api/live/boxes"
+    max_hz: float = 10.0                    # never send more often than this
+    timeout_seconds: float = 1.0            # short on purpose: a slow server must not pile up
+
+    # -- serve mode (features.live_stream) --
+    serve_host: str = "0.0.0.0"             # "127.0.0.1" = this machine only
+    serve_port: int = 8090
+    stream_fps: float = 10.0                # max frames/second per viewer
+    stream_width: int = 960                 # downscale to this width before encoding; 0 = full size
+    jpeg_quality: int = 70                  # 1-100; lower = less bandwidth and CPU
+    box_max_age_seconds: float = 1.0        # boxes older than this are not drawn (detector stalled)
+    auth_token: Optional[str] = None        # if set, viewers must send it (?token= or Bearer header)
+
+
+@dataclass
 class FeaturesConfig:
     """ONE centralized on/off switchboard for the whole pipeline.
 
@@ -259,6 +290,8 @@ class FeaturesConfig:
     ocr_read: bool = True                        # run OCR on a saved plate crop to read its text
     save_images_to_disk: bool = True             # also keep a JPEG copy under output/
     show_preview: bool = False                   # live OpenCV preview window (keep OFF on a headless Pi)
+    live_boxes: bool = False                     # PUSH per-frame boxes (JSON) to live.endpoint_url
+    live_stream: bool = False                    # SERVE live frames + boxes over HTTP for the dashboard to pull
 
     # ---- per-stage timing measurement ----
     time_vehicle_detect: bool = True
@@ -305,6 +338,7 @@ class PipelineConfig:
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     features: FeaturesConfig = field(default_factory=FeaturesConfig)
     api: ApiConfig = field(default_factory=ApiConfig)
+    live: LiveConfig = field(default_factory=LiveConfig)
 
     @classmethod
     def load(cls, yaml_path: Optional[str] = None) -> "PipelineConfig":

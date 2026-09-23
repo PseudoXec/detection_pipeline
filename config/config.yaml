@@ -75,6 +75,8 @@ features:
   ocr_read: true                      # read plate text with OCR right after a plate crop is saved
   save_images_to_disk: true           # also keep a JPEG copy of every crop under output/
   show_preview: false                 # live OpenCV preview window - keep OFF on a headless Pi
+  live_stream: true                   # SERVE live frames + boxes over HTTP; the dashboard pulls them (see live: below)
+  live_boxes: false                   # PUSH boxes only (JSON, no frames) to live.endpoint_url - needs a server endpoint
 
   # -- per-stage ms timing --
   time_vehicle_detect: true
@@ -111,3 +113,29 @@ features:
 api:
   endpoint_url: null   # e.g. "https://dashboard.local/api/detections" - null = sends stay off/fail closed
   timeout_seconds: 5.0
+
+# ---------------------------------------------------------------------------
+# live - live view for the command center
+# ---------------------------------------------------------------------------
+# features.live_stream: true  -> the Pi serves the video itself, nothing to configure on the server:
+#     http://<pi-ip>:8090/live/stream.mjpg   MJPEG stream (browser / WebView2 / MJPEG client)
+#     http://<pi-ip>:8090/live/frame.jpg     single JPEG (poll it)
+#     http://<pi-ip>:8090/live/boxes         latest tracker boxes as JSON
+#     add ?overlay=0 for the raw frame without boxes drawn in
+# features.live_boxes: true   -> old push mode, boxes only, needs endpoint_url below
+live:
+  camera_id: "cam1"     # short name shown in the viewer; do NOT use the RTSP URL (it has the password)
+
+  # serve mode (features.live_stream)
+  serve_host: "0.0.0.0"
+  serve_port: 8090
+  stream_fps: 10        # max frames per second per viewer
+  stream_width: 960     # downscale before encoding (0 = full size); keeps the Pi's CPU free for detection
+  jpeg_quality: 70
+  box_max_age_seconds: 1.0
+  auth_token: null      # SET THIS: anyone on the network can watch the camera otherwise
+
+  # push mode (features.live_boxes)
+  endpoint_url: null    # e.g. "http://server:8000/api/live/boxes"
+  max_hz: 10
+  timeout_seconds: 1.0
