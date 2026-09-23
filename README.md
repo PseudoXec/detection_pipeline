@@ -103,6 +103,11 @@ this pipeline keeps writing - no file locking conflicts.
 
 ### Table: `detections`
 
+> If you're upgrading from an older copy of this pipeline, the schema below
+> added new `NOT NULL` box-coordinate columns. `CREATE TABLE IF NOT EXISTS`
+> won't retrofit an existing database file, so run `python reset_buffer.py`
+> once after upgrading to start with a fresh, matching schema.
+
 | Column | Type | Meaning |
 |---|---|---|
 | `id` | INTEGER | primary key |
@@ -111,9 +116,11 @@ this pipeline keeps writing - no file locking conflicts.
 | `vehicle_class` | TEXT | e.g. `car`, `truck`, `motorcycle` |
 | `vehicle_confidence` | REAL | vehicle model confidence, 0-1 |
 | `vehicle_image` | BLOB | JPEG bytes of the vehicle crop |
+| `vehicle_box_x1/y1/x2/y2` | REAL | vehicle box pixel edges **in the full camera frame** - draw this on the original frame |
 | `plate_detected` | INTEGER | 0 or 1 |
 | `plate_confidence` | REAL (nullable) | plate model confidence, 0-1; NULL if no plate |
 | `plate_image` | BLOB (nullable) | JPEG bytes of the plate crop; NULL if no plate |
+| `plate_box_x1/y1/x2/y2` | REAL (nullable) | plate box pixel edges **in the vehicle crop** (i.e. relative to `vehicle_image`, not the full frame) - draw this on top of the vehicle image; NULL if no plate |
 | `detected_at` | TEXT | ISO-8601 timestamp the vehicle was first seen |
 | `vehicle_crop_ms` | REAL | time to crop the vehicle after detection |
 | `plate_detect_ms` | REAL | time spent running the plate model |
@@ -161,7 +168,7 @@ functions they were exercising still exist, just split across smaller files.
 
 ---
 
-## 8. Speeding things up further
+## 8. Speeding things up further / re-exporting models
 
 `export_openvino.py` converts a `.pt` checkpoint into an OpenVINO export,
 which runs noticeably faster on the Pi 5's CPU:
@@ -170,3 +177,11 @@ python export_openvino.py --weights models/vehicle.pt --imgsz 480 --benchmark --
 ```
 Point `config.yaml`'s `model.vehicle_weights` / `model.plate_weights` at the
 resulting folder.
+
+**Important:** a static-shape OpenVINO export only accepts exactly the size
+it was exported at - feed it anything else and inference throws a shape-
+mismatch error. If you re-export a model at a different `--imgsz`, update
+`model.vehicle_imgsz` / `model.plate_imgsz` in `config.yaml` to match, or the
+pipeline will crash on the first real frame. The two shipped models in
+`models/` were exported at 480 (vehicle) and 640 (plate), which is why those
+are the config defaults.

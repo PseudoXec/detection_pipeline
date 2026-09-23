@@ -98,8 +98,15 @@ class ModelConfig:
     # None = let ultralytics choose (CPU on a Pi, GPU if one is present)
     device: Optional[str] = None
 
-    # inference image size fed to both models
-    imgsz: int = 640
+    # inference image size fed to EACH model. These are separate because a
+    # static-shape OpenVINO export is compiled for exactly one input size -
+    # if you exported vehicle.pt at --imgsz 480 (a common choice: the vehicle
+    # model scans the whole frame, so a smaller size = faster), it will ONLY
+    # accept 480x480 input. Feeding it 640x640 here throws a shape-mismatch
+    # error from OpenVINO. These numbers MUST match whatever --imgsz you
+    # used in export_openvino.py for each model.
+    vehicle_imgsz: int = 480
+    plate_imgsz: int = 640
 
     # confidence / NMS thresholds per stage
     vehicle_conf_threshold: float = 0.35
@@ -149,12 +156,13 @@ class CropConfig:
 
 @dataclass
 class PreprocessConfig:
-    """Optional image enhancement steps."""
+    """Non-toggle tuning values for image enhancement steps.
 
-    # sharpen/denoise the vehicle crop before running plate detection on it
-    enhance_before_plate_detect: bool = True
-    # sharpen/denoise/upscale the final plate crop before saving it
-    enhance_plate_crop: bool = True
+    Whether these steps RUN AT ALL is controlled centrally in
+    `FeaturesConfig` (`enhance_before_plate_detect` / `enhance_plate_crop`)
+    - this section only holds the numeric knobs for them.
+    """
+
     plate_crop_min_height: int = 64
 
 
@@ -167,10 +175,9 @@ class StorageConfig:
     # while this process keeps writing.
     database_path: str = str(BASE_DIR / "data" / "pipeline_buffer.db")
 
-    # keep a JPEG copy of every crop on disk as well as inside the database.
-    # Handy for manual inspection / debugging; can be turned off to save
-    # SD-card writes on a Pi that runs 24/7.
-    save_images_to_disk: bool = True
+    # whether a JPEG copy of every crop is ALSO kept on disk is controlled
+    # centrally in FeaturesConfig.save_images_to_disk - this is just where
+    # it's written to when that's on.
     output_dir: str = str(BASE_DIR / "output")
 
     # JPEG quality used both for the DB blob and the on-disk copy
@@ -191,10 +198,58 @@ class RuntimeConfig:
     """Misc. operational knobs."""
 
     log_level: str = "INFO"
-    # show a live OpenCV preview window; turn this OFF on a headless Pi
-    show_preview: bool = False
     # finite run for testing; 0 = run forever (production/24-7 mode)
     max_frames: int = 0
+
+
+@dataclass
+class FeaturesConfig:
+    """ONE centralized on/off switchboard for the whole pipeline.
+
+    Every optional behavior - which pipeline stages run, what gets timed,
+    what gets printed to the console, and which individual SQL columns get
+    populated - lives here as a plain True/False. Flip any of these in
+    config.yaml under `features:` without touching any other file.
+
+    A column toggle set to False does not remove the column from the
+    database (the schema is fixed so the C# dashboard can always rely on
+    it) - it just leaves that column NULL/empty instead of computing and
+    storing the value, which is what "off" means for image/box data too.
+    """
+
+    # ---- pipeline stage / behavior toggles ----
+    roi_filter: bool = True                    # drop detections outside the configured ROI
+    fallback_tracker: bool = True               # use the simple tracker when ByteTrack can't assign an ID
+    position_dedup: bool = True                 # skip re-saving a vehicle that's just sitting still
+    plate_detection: bool = True                # run the plate model at all (False = vehicles only)
+    enhance_before_plate_detect: bool = True     # CLAHE + sharpen the vehicle crop before plate detection
+    enhance_plate_crop: bool = True              # CLAHE + sharpen + upscale the saved plate crop
+    save_images_to_disk: bool = True             # also keep a JPEG copy under output/
+    show_preview: bool = False                   # live OpenCV preview window (keep OFF on a headless Pi)
+
+    # ---- per-stage timing measurement ----
+    time_vehicle_detect: bool = True
+    time_vehicle_crop: bool = True
+    time_plate_detect: bool = True
+    time_plate_crop: bool = True
+
+    # ---- console output ----
+    print_console: bool = True                  # any per-vehicle console line at all
+    print_timing: bool = True                    # include the ms breakdown in that line
+
+    # ---- SQLite storage ----
+    store_to_sqlite: bool = True                 # master switch: write rows to the buffer DB at all
+
+    # individual columns - each can be turned off independently
+    col_vehicle_image: bool = True
+    col_vehicle_box: bool = True
+    col_plate_image: bool = True
+    col_plate_box: bool = True
+    col_vehicle_detect_ms: bool = True
+    col_vehicle_crop_ms: bool = True
+    col_plate_detect_ms: bool = True
+    col_plate_crop_ms: bool = True
+    col_total_pipeline_ms: bool = True
 
 
 @dataclass
@@ -209,6 +264,7 @@ class PipelineConfig:
     preprocess: PreprocessConfig = field(default_factory=PreprocessConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
+    features: FeaturesConfig = field(default_factory=FeaturesConfig)
 
     @classmethod
     def load(cls, yaml_path: Optional[str] = None) -> "PipelineConfig":

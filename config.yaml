@@ -7,7 +7,7 @@
 
 camera:
   # set this to your camera's RTSP URL for 24/7 live operation
-  rtsp_url: "rtsp://admin:password@192.168.1.50:554/stream1"
+  rtsp_url: "rtsp://admin:Victoria2313*@192.168.100.229:554/stream1"
   frame_width: 1280
   frame_height: 720
   capture_buffer_size: 1          # 1 = always the newest frame, never a stale queued one
@@ -25,7 +25,8 @@ model:
   vehicle_weights: "models/vehicle_openvino_model"
   plate_weights: "models/platenum_closeup_openvino_model"
   device: null                    # null = auto; OpenVINO folders ignore this anyway
-  imgsz: 640
+  vehicle_imgsz: 480               # must match the size vehicle.pt was exported at
+  plate_imgsz: 640                 # must match the size platenum_closeup.pt was exported at
   vehicle_conf_threshold: 0.35
   plate_conf_threshold: 0.35
   vehicle_classes: null           # e.g. "car,truck,bus,motorcycle"; null = accept all
@@ -34,14 +35,61 @@ tracking:
   dedup_cooldown_seconds: 2.0     # don't re-log a vehicle sitting still for this long
   max_plate_attempts: 3           # give up looking for a plate after this many tries
 
+preprocess:
+  plate_crop_min_height: 64       # whether enhancement RUNS is under features: below
+
 storage:
   database_path: "data/pipeline_buffer.db"   # SQLite buffer read by the C# dashboard
-  save_images_to_disk: true                  # also keep a JPEG copy under output/
   output_dir: "output"
   jpeg_quality: 90
   retention_days: 14                         # auto-delete synced rows older than this
 
 runtime:
   log_level: "INFO"
-  show_preview: false             # keep OFF on a headless Raspberry Pi
   max_frames: 0                   # 0 = run forever
+
+# ---------------------------------------------------------------------------
+# features
+# ---------------------------------------------------------------------------
+# ONE centralized on/off switchboard. Every optional pipeline behavior, every
+# timing measurement, console printing, and every individual SQL column is a
+# plain true/false here - nothing else in this file needs to change to turn
+# something on or off.
+#
+# A column set to false is NOT removed from the database (the schema stays
+# fixed so the C# dashboard can always rely on it) - it's just left NULL
+# instead of being computed and stored.
+features:
+  # -- pipeline stages / behavior --
+  roi_filter: true                    # drop detections outside the ROI box above
+  fallback_tracker: true              # simple tracker used only if ByteTrack can't assign an ID
+  position_dedup: true                # don't re-save a vehicle that's just sitting still
+  plate_detection: true               # run the plate model at all (false = log vehicles only)
+  enhance_before_plate_detect: true   # CLAHE + sharpen the vehicle crop before plate detection
+  enhance_plate_crop: true            # CLAHE + sharpen + upscale the saved plate crop
+  save_images_to_disk: true           # also keep a JPEG copy of every crop under output/
+  show_preview: false                 # live OpenCV preview window - keep OFF on a headless Pi
+
+  # -- per-stage ms timing --
+  time_vehicle_detect: true
+  time_vehicle_crop: true
+  time_plate_detect: true
+  time_plate_crop: true
+
+  # -- console output --
+  print_console: true                 # print a line per finalized vehicle
+  print_timing: true                  # include the ms breakdown in that line
+
+  # -- SQLite storage --
+  store_to_sqlite: true               # master switch: write rows to the buffer DB at all
+
+  # individual columns - each can be switched off independently
+  col_vehicle_image: true
+  col_vehicle_box: true
+  col_plate_image: true
+  col_plate_box: true
+  col_vehicle_detect_ms: true
+  col_vehicle_crop_ms: true
+  col_plate_detect_ms: true
+  col_plate_crop_ms: true
+  col_total_pipeline_ms: true

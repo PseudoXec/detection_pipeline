@@ -132,7 +132,7 @@ def run_on_stream(pipeline: DetectionPipeline, config: PipelineConfig) -> None:
             pipeline.process_frame(captured.image)
             frames_processed += 1
 
-            if config.runtime.show_preview:
+            if config.features.show_preview:
                 cv2.imshow("pipeline preview", captured.image)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
@@ -142,7 +142,7 @@ def run_on_stream(pipeline: DetectionPipeline, config: PipelineConfig) -> None:
                 break
     finally:
         camera.stop()
-        if config.runtime.show_preview:
+        if config.features.show_preview:
             cv2.destroyAllWindows()
 
 

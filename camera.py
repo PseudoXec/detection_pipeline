@@ -87,8 +87,20 @@ class ThreadedRTSPCamera:
         self._thread: Optional[threading.Thread] = None
 
     def start(self) -> "ThreadedRTSPCamera":
-        """Open the stream and start the background grabber thread."""
-        self._open_capture()
+        """Open the stream and start the background grabber thread.
+
+        If the very first connection attempt fails (camera off, wrong IP,
+        network not up yet on boot, etc.) this must NOT crash the whole
+        process - a 24/7 service should just keep retrying until the camera
+        becomes reachable, exactly like it does for a reconnect later on.
+        """
+        try:
+            self._open_capture()
+        except RuntimeError as error:
+            print(f"[camera] {error}")
+            print(f"[camera] retrying every {self.reconnect_delay_seconds:.0f}s until the camera is reachable...")
+            self._reconnect()
+
         self._thread = threading.Thread(target=self._grab_loop, daemon=True)
         self._thread.start()
         return self
@@ -102,6 +114,11 @@ class ThreadedRTSPCamera:
         # a buffer size of 1 means OpenCV won't queue up old frames internally -
         # every read() call gets the most recently decoded frame
         capture.set(cv2.CAP_PROP_BUFFERSIZE, self.buffer_size)
+        # OpenCV's FFmpeg backend otherwise hangs for its own default of ~30s
+        # before giving up on an unreachable camera; fail faster so reconnect
+        # attempts are quick instead of a 30-second stall each time
+        capture.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 8000)
+        capture.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 8000)
 
         if not capture.isOpened():
             capture.release()
