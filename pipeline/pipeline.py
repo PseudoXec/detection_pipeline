@@ -25,13 +25,13 @@ from typing import Any, Dict, List, Optional
 import cv2
 import numpy as np
 
-import detector
-import image_ops
-from config import PipelineConfig
-from geometry import crop_vehicle, crop_plate, is_inside_roi, compute_containment, compute_iou, box_edges
-from storage import DetectionStorage, DetectionRecord
-from timing import VehicleTiming, Stopwatch
-from tracker import FallbackTracker, PositionDeduper, needs_fallback_tracker
+from detection import detector
+from detection import image_ops
+from config.config import PipelineConfig
+from detection.geometry import crop_vehicle, crop_plate, is_inside_roi, compute_containment, compute_iou, box_edges
+from storage.storage import DetectionStorage, DetectionRecord
+from pipeline.timing import VehicleTiming, Stopwatch
+from detection.tracker import FallbackTracker, PositionDeduper, needs_fallback_tracker
 
 
 class DetectionPipeline:
@@ -92,7 +92,6 @@ class DetectionPipeline:
     def _detect_and_track_vehicles(self, frame: np.ndarray) -> List[Dict[str, Any]]:
         model_cfg, tracking_cfg, features = self.config.model, self.config.tracking, self.config.features
 
-<<<<<<< HEAD
         with Stopwatch() as sw:
             vehicle_predictions = detector.track(
                 self.vehicle_model, frame,
@@ -100,13 +99,6 @@ class DetectionPipeline:
                 model_cfg.vehicle_imgsz, tracking_cfg.bytetrack_config, self.vehicle_classes,
             )
         self._last_vehicle_detect_ms = sw.ms if features.time_vehicle_detect else None
-=======
-        vehicle_predictions = detector.track(
-            self.vehicle_model, frame,
-            model_cfg.vehicle_conf_threshold, model_cfg.vehicle_iou_threshold,
-            model_cfg.vehicle_imgsz, tracking_cfg.bytetrack_config, self.vehicle_classes,
-        )
->>>>>>> a61824a5fd18bc7aa7dc05598005c6342096ad5e
 
         # ByteTrack occasionally can't assign an ID (e.g. right after a
         # reconnect); when that happens, fall back to our own simple tracker
@@ -197,19 +189,12 @@ class DetectionPipeline:
 
         model_cfg = self.config.model
         try:
-<<<<<<< HEAD
             with Stopwatch() as sw:
                 batch_results = detector.detect_batch(
                     self.plate_model, crops,
                     model_cfg.plate_conf_threshold, model_cfg.vehicle_iou_threshold, model_cfg.plate_imgsz,
                 )
             self._last_plate_detect_ms = sw.ms if features.time_plate_detect else None
-=======
-            batch_results = detector.detect_batch(
-                self.plate_model, crops,
-                model_cfg.plate_conf_threshold, model_cfg.vehicle_iou_threshold, model_cfg.plate_imgsz,
-            )
->>>>>>> a61824a5fd18bc7aa7dc05598005c6342096ad5e
         except detector.InferenceError as error:
             if features.print_console:
                 print(f"[pipeline] plate detection error: {error}")
@@ -247,15 +232,9 @@ class DetectionPipeline:
             # raw detection box edges, in the vehicle crop's own pixel space -
             # exactly what's needed to draw a rectangle on the stored vehicle_image
             plate_x1, plate_y1, plate_x2, plate_y2 = box_edges(best_plate)
-<<<<<<< HEAD
             with Stopwatch() as sw:
                 plate_crop = crop_plate(vehicle_crop, best_plate, crop_cfg.plate_padding_pixels, crop_cfg.plate_min_crop_height)
                 if plate_crop is not None and features.enhance_plate_crop:
-=======
-            plate_crop = crop_plate(vehicle_crop, best_plate, crop_cfg.plate_padding_pixels, crop_cfg.plate_min_crop_height)
-            if plate_crop is not None:
-                if preprocess_cfg.enhance_plate_crop:
->>>>>>> a61824a5fd18bc7aa7dc05598005c6342096ad5e
                     plate_crop = image_ops.enhance_plate_crop(plate_crop, preprocess_cfg.plate_crop_min_height)
             timing.plate_crop_ms = sw.ms if features.time_plate_crop else None
 
@@ -274,16 +253,11 @@ class DetectionPipeline:
         # needed to draw this vehicle's box back onto the full camera frame
         vehicle_x1, vehicle_y1, vehicle_x2, vehicle_y2 = box_edges(base_prediction)
 
-        # vehicle box edges, in the ORIGINAL FULL FRAME's pixel space - what's
-        # needed to draw this vehicle's box back onto the full camera frame
-        vehicle_x1, vehicle_y1, vehicle_x2, vehicle_y2 = box_edges(base_prediction)
-
         record = DetectionRecord(
             track_id=track_id,
             camera_source=self.camera_source,
             vehicle_class=str(base_prediction.get("class") or "vehicle"),
             vehicle_confidence=float(base_prediction.get("confidence", 0.0)),
-<<<<<<< HEAD
             vehicle_image_jpeg=image_ops.encode_jpeg(vehicle_crop, self.config.storage.jpeg_quality) if features.col_vehicle_image else None,
             vehicle_box_x1=vehicle_x1 if features.col_vehicle_box else None,
             vehicle_box_y1=vehicle_y1 if features.col_vehicle_box else None,
@@ -296,20 +270,6 @@ class DetectionPipeline:
             plate_box_y1=plate_y1 if features.col_plate_box else None,
             plate_box_x2=plate_x2 if features.col_plate_box else None,
             plate_box_y2=plate_y2 if features.col_plate_box else None,
-=======
-            vehicle_image_jpeg=image_ops.encode_jpeg(vehicle_crop, self.config.storage.jpeg_quality),
-            vehicle_box_x1=vehicle_x1,
-            vehicle_box_y1=vehicle_y1,
-            vehicle_box_x2=vehicle_x2,
-            vehicle_box_y2=vehicle_y2,
-            plate_detected=plate_detected,
-            plate_confidence=plate_confidence,
-            plate_image_jpeg=plate_image_bytes,
-            plate_box_x1=plate_x1,
-            plate_box_y1=plate_y1,
-            plate_box_x2=plate_x2,
-            plate_box_y2=plate_y2,
->>>>>>> a61824a5fd18bc7aa7dc05598005c6342096ad5e
             detected_at=datetime.now(),
             vehicle_detect_ms=timing.vehicle_detect_ms if features.col_vehicle_detect_ms else None,
             vehicle_crop_ms=timing.vehicle_crop_ms if features.col_vehicle_crop_ms else None,

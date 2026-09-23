@@ -21,7 +21,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 # shared box-math helpers live in geometry.py so both trackers use identical math
-from geometry import compute_iou, center_distance_in_widths
+from detection.geometry import compute_iou, center_distance_in_widths
 
 
 def needs_fallback_tracker(vehicle_predictions: List[Dict[str, Any]]) -> bool:

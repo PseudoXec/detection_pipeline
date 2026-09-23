@@ -31,7 +31,7 @@ import os
 # shutil.rmtree removes the whole output/ folder tree in one call
 import shutil
 
-from config import PipelineConfig
+from config.config import PipelineConfig
 
 
 def reset(config: PipelineConfig) -> None:

@@ -36,18 +36,7 @@ tracking:
   max_plate_attempts: 3           # give up looking for a plate after this many tries
 
 preprocess:
-<<<<<<< HEAD
   plate_crop_min_height: 64       # whether enhancement RUNS is under features: below
-=======
-  # CLAHE contrast + sharpen on the vehicle crop BEFORE plate detection runs.
-  # This is the setting most likely to affect detection accuracy - if plates
-  # are being missed or misdetected, try setting this to false first so the
-  # model sees the raw, untouched crop.
-  enhance_before_plate_detect: true
-  # CLAHE contrast + sharpen + upscale on the final plate crop before saving.
-  # Only affects the saved/stored image, not detection - safe to leave on.
-  enhance_plate_crop: true
->>>>>>> a61824a5fd18bc7aa7dc05598005c6342096ad5e
 
 storage:
   database_path: "data/pipeline_buffer.db"   # SQLite buffer read by the C# dashboard
@@ -59,6 +48,17 @@ runtime:
   log_level: "INFO"
   max_frames: 0                   # 0 = run forever
 
+# ---------------------------------------------------------------------------
+# features
+# ---------------------------------------------------------------------------
+# ONE centralized on/off switchboard. Every optional pipeline behavior, every
+# timing measurement, console printing, and every individual SQL column is a
+# plain true/false here - nothing else in this file needs to change to turn
+# something on or off.
+#
+# A column set to false is NOT removed from the database (the schema stays
+# fixed so the C# dashboard can always rely on it) - it's just left NULL
+# instead of being computed and stored.
 features:
   # -- pipeline stages / behavior --
   roi_filter: true                    # drop detections outside the ROI box above
@@ -83,6 +83,10 @@ features:
   # -- SQLite storage --
   store_to_sqlite: true               # master switch: write rows to the buffer DB at all
 
+  # -- API delivery (placeholder until the C# dashboard endpoint exists) --
+  send_via_api: false                 # POST each record to api.endpoint_url below
+  delete_row_after_api_send: true     # remove the SQLite row once the API send succeeds
+
   # individual columns - each can be switched off independently
   col_vehicle_image: true
   col_vehicle_box: true
@@ -93,3 +97,10 @@ features:
   col_plate_detect_ms: true
   col_plate_crop_ms: true
   col_total_pipeline_ms: true
+
+# ---------------------------------------------------------------------------
+# api - placeholder until the C# dev provides the real endpoint
+# ---------------------------------------------------------------------------
+api:
+  endpoint_url: null   # e.g. "https://dashboard.local/api/detections" - null = sends stay off/fail closed
+  timeout_seconds: 5.0

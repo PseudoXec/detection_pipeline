@@ -35,11 +35,11 @@ import time
 
 import cv2
 
-from camera import ThreadedRTSPCamera, configure_decode_threads
-from config import PipelineConfig
-from pipeline import DetectionPipeline
-from storage import DetectionStorage
-import detector
+from camera.camera import ThreadedRTSPCamera, configure_decode_threads
+from config.config import PipelineConfig
+from pipeline.pipeline import DetectionPipeline
+from storage.storage import DetectionStorage
+from detection import detector
 
 log = logging.getLogger("pipeline")
 
@@ -181,6 +181,10 @@ def main() -> None:
         database_path=config.storage.database_path,
         batch_size=config.storage.write_batch_size,
         flush_interval_seconds=config.storage.write_flush_interval_seconds,
+        send_via_api=config.features.send_via_api,
+        delete_row_after_api_send=config.features.delete_row_after_api_send,
+        api_endpoint_url=config.api.endpoint_url,
+        api_timeout_seconds=config.api.timeout_seconds,
     ).start()
     start_retention_housekeeping(storage, config.storage.retention_days)
 

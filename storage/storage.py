@@ -116,10 +116,19 @@ class DetectionStorage:
         database_path: str,
         batch_size: int = 8,
         flush_interval_seconds: float = 1.0,
+        send_via_api: bool = False,
+        delete_row_after_api_send: bool = True,
+        api_endpoint_url: Optional[str] = None,
+        api_timeout_seconds: float = 5.0,
     ):
         self.database_path = database_path
         self.batch_size = batch_size
         self.flush_interval_seconds = flush_interval_seconds
+        # placeholder API delivery - see api_client.py; safe to leave off
+        self.send_via_api = send_via_api
+        self.delete_row_after_api_send = delete_row_after_api_send
+        self.api_endpoint_url = api_endpoint_url
+        self.api_timeout_seconds = api_timeout_seconds
 
         # make sure the folder for the .db file actually exists first
         os.makedirs(os.path.dirname(os.path.abspath(database_path)) or ".", exist_ok=True)
@@ -196,58 +205,63 @@ class DetectionStorage:
         connection.close()
 
     def _write_batch(self, connection: sqlite3.Connection, records: List[DetectionRecord]) -> None:
-        """Insert a batch of records in a single transaction (fast + crash-safe)."""
-        rows = [
-            (
-                record.track_id,
-                record.camera_source,
-                record.vehicle_class,
-                record.vehicle_confidence,
-                record.vehicle_image_jpeg,
-                record.vehicle_box_x1,
-                record.vehicle_box_y1,
-                record.vehicle_box_x2,
-                record.vehicle_box_y2,
-                1 if record.plate_detected else 0,
-                record.plate_confidence,
-                record.plate_image_jpeg,
-                record.plate_box_x1,
-                record.plate_box_y1,
-                record.plate_box_x2,
-                record.plate_box_y2,
-                record.detected_at.isoformat(sep=" ", timespec="seconds"),
-                record.vehicle_detect_ms,
-                record.vehicle_crop_ms,
-                record.plate_detect_ms,
-                record.plate_crop_ms,
-                record.total_pipeline_ms,
-            )
-            for record in records
-        ]
+        """Insert a batch of records (one INSERT per record, in one
+        transaction, so we can capture each row's own id) then, if
+        `send_via_api` is on, POST each record and delete its row on success."""
+        inserted_ids: List[int] = []
         try:
             with connection:  # commits automatically on success, rolls back on error
-                connection.executemany(
-                    """
-                    INSERT INTO detections (
-                        track_id, camera_source, vehicle_class, vehicle_confidence,
-                        vehicle_image, vehicle_box_x1, vehicle_box_y1, vehicle_box_x2, vehicle_box_y2,
-                        plate_detected, plate_confidence, plate_image,
-                        plate_box_x1, plate_box_y1, plate_box_x2, plate_box_y2,
-<<<<<<< HEAD
-                        detected_at, vehicle_detect_ms, vehicle_crop_ms, plate_detect_ms, plate_crop_ms,
-                        total_pipeline_ms
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-=======
-                        detected_at, vehicle_crop_ms, plate_detect_ms, plate_crop_ms,
-                        total_pipeline_ms
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
->>>>>>> a61824a5fd18bc7aa7dc05598005c6342096ad5e
-                    """,
-                    rows,
-                )
+                cursor = connection.cursor()
+                for record in records:
+                    cursor.execute(
+                        """
+                        INSERT INTO detections (
+                            track_id, camera_source, vehicle_class, vehicle_confidence,
+                            vehicle_image, vehicle_box_x1, vehicle_box_y1, vehicle_box_x2, vehicle_box_y2,
+                            plate_detected, plate_confidence, plate_image,
+                            plate_box_x1, plate_box_y1, plate_box_x2, plate_box_y2,
+                            detected_at, vehicle_detect_ms, vehicle_crop_ms, plate_detect_ms, plate_crop_ms,
+                            total_pipeline_ms
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            record.track_id, record.camera_source, record.vehicle_class,
+                            record.vehicle_confidence, record.vehicle_image_jpeg,
+                            record.vehicle_box_x1, record.vehicle_box_y1, record.vehicle_box_x2, record.vehicle_box_y2,
+                            1 if record.plate_detected else 0, record.plate_confidence, record.plate_image_jpeg,
+                            record.plate_box_x1, record.plate_box_y1, record.plate_box_x2, record.plate_box_y2,
+                            record.detected_at.isoformat(sep=" ", timespec="seconds"),
+                            record.vehicle_detect_ms, record.vehicle_crop_ms,
+                            record.plate_detect_ms, record.plate_crop_ms, record.total_pipeline_ms,
+                        ),
+                    )
+                    inserted_ids.append(cursor.lastrowid)
         except sqlite3.Error as error:
             # a storage failure should never crash the whole pipeline - log and move on
-            print(f"[storage] failed to write {len(rows)} record(s): {error}")
+            print(f"[storage] failed to write {len(records)} record(s): {error}")
+            return
+
+        if self.send_via_api:
+            self._send_and_maybe_delete(connection, records, inserted_ids)
+
+    def _send_and_maybe_delete(
+        self, connection: sqlite3.Connection, records: List[DetectionRecord], row_ids: List[int],
+    ) -> None:
+        """PLACEHOLDER API hand-off: POST each just-written record to the
+        C# dashboard's API; if that succeeds AND `delete_row_after_api_send`
+        is on, remove its SQLite row immediately instead of waiting for the
+        dashboard's own sync/delete pass. On failure the row is simply left
+        in place (synced=0) so the normal SQLite hand-off still covers it."""
+        from api import api_client  # imported here to avoid a hard dependency when the feature is off
+
+        sent_ids = []
+        for record, row_id in zip(records, row_ids):
+            if api_client.send_detection(record, self.api_endpoint_url, self.api_timeout_seconds):
+                sent_ids.append(row_id)
+
+        if sent_ids and self.delete_row_after_api_send:
+            with connection:
+                connection.executemany("DELETE FROM detections WHERE id = ?", [(rid,) for rid in sent_ids])
 
     def delete_synced_older_than(self, days: int) -> int:
         """Housekeeping: remove rows the dashboard has already consumed

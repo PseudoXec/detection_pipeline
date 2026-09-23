@@ -19,3 +19,4 @@ lap>=0.5.12          # required by ByteTrack (the tracker used in tracker.py)
 # ARM boards. If pip struggles, use opencv-python-headless instead (no GUI
 # bindings needed for a 24/7 headless service anyway):
 #   pip install opencv-python-headless
+requests>=2.31.0

@@ -24,9 +24,11 @@ from typing import Optional
 import yaml
 
 
-# folder this file lives in -> used to build default paths that work no
-# matter where the pipeline is installed (important once it's deployed to a Pi)
-BASE_DIR = Path(__file__).resolve().parent
+# this file now lives in config/ - PROJECT_ROOT is the actual project folder
+# (models/, data/, output/ all live there), CONFIG_DIR is where config.py
+# and config.yaml sit alongside each other
+CONFIG_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = CONFIG_DIR.parent
 
 
 @dataclass
@@ -91,9 +93,9 @@ class ModelConfig:
     """Where the two YOLO models live and how they run."""
 
     # folder or .pt file for the vehicle detector
-    vehicle_weights: str = str(BASE_DIR / "models" / "vehicle_openvino_model")
+    vehicle_weights: str = str(PROJECT_ROOT / "models" / "vehicle_openvino_model")
     # folder or .pt file for the plate detector
-    plate_weights: str = str(BASE_DIR / "models" / "platenum_closeup_openvino_model")
+    plate_weights: str = str(PROJECT_ROOT / "models" / "platenum_closeup_openvino_model")
 
     # None = let ultralytics choose (CPU on a Pi, GPU if one is present)
     device: Optional[str] = None
@@ -123,7 +125,7 @@ class TrackingConfig:
     """How we keep 'the same physical vehicle' from being logged twice."""
 
     # ByteTrack config shipped alongside this package
-    bytetrack_config: str = str(BASE_DIR / "bytetrack_custom.yaml")
+    bytetrack_config: str = str(CONFIG_DIR / "bytetrack_custom.yaml")
 
     # fallback tracker thresholds, used only if ByteTrack fails to assign IDs
     iou_threshold: float = 0.3
@@ -156,7 +158,6 @@ class CropConfig:
 
 @dataclass
 class PreprocessConfig:
-<<<<<<< HEAD
     """Non-toggle tuning values for image enhancement steps.
 
     Whether these steps RUN AT ALL is controlled centrally in
@@ -164,28 +165,6 @@ class PreprocessConfig:
     - this section only holds the numeric knobs for them.
     """
 
-=======
-    """Optional image enhancement steps.
-
-    These exist to help the plate model find small/low-contrast plates, but
-    they are NOT free: CLAHE contrast boosting + sharpening can also
-    introduce artifacts (halos, exaggerated noise, blown-out highlights)
-    that make some models detect WORSE, not better - this depends heavily
-    on how the model itself was trained. If you notice accuracy drop after
-    enabling either flag below, turn it off; the model then sees the raw
-    camera crop untouched.
-    """
-
-    # sharpen/denoise the vehicle crop before running plate detection on it.
-    # Turn this OFF first if plate-detection accuracy looks worse than
-    # expected - this is the step most likely to hurt a model that was
-    # trained on plain, un-enhanced crops.
-    enhance_before_plate_detect: bool = True
-    # sharpen/denoise/upscale the final plate crop before saving it.
-    # This one only affects what gets SAVED/stored, not detection itself,
-    # so it's safe to leave on even if you turn the flag above off.
-    enhance_plate_crop: bool = True
->>>>>>> a61824a5fd18bc7aa7dc05598005c6342096ad5e
     plate_crop_min_height: int = 64
 
 
@@ -196,12 +175,12 @@ class StorageConfig:
     # SQLite file used as the hand-off buffer between this pipeline and the
     # C# dashboard. WAL mode (enabled in storage.py) lets the dashboard read
     # while this process keeps writing.
-    database_path: str = str(BASE_DIR / "data" / "pipeline_buffer.db")
+    database_path: str = str(PROJECT_ROOT / "data" / "pipeline_buffer.db")
 
     # whether a JPEG copy of every crop is ALSO kept on disk is controlled
     # centrally in FeaturesConfig.save_images_to_disk - this is just where
     # it's written to when that's on.
-    output_dir: str = str(BASE_DIR / "output")
+    output_dir: str = str(PROJECT_ROOT / "output")
 
     # JPEG quality used both for the DB blob and the on-disk copy
     jpeg_quality: int = 90
@@ -223,6 +202,19 @@ class RuntimeConfig:
     log_level: str = "INFO"
     # finite run for testing; 0 = run forever (production/24-7 mode)
     max_frames: int = 0
+
+
+@dataclass
+class ApiConfig:
+    """Placeholder settings for sending detections to the C# dashboard's API.
+
+    `endpoint_url` is None until the C# dev provides the real URL - leaving
+    it unset is safe even with `features.send_via_api: true`; sends just
+    fail closed and the row stays in SQLite as normal.
+    """
+
+    endpoint_url: Optional[str] = None      # e.g. "https://dashboard.local/api/detections"
+    timeout_seconds: float = 5.0
 
 
 @dataclass
@@ -263,6 +255,10 @@ class FeaturesConfig:
     # ---- SQLite storage ----
     store_to_sqlite: bool = True                 # master switch: write rows to the buffer DB at all
 
+    # ---- API delivery (placeholder until the C# dashboard endpoint exists) ----
+    send_via_api: bool = False                   # POST each record to api.endpoint_url
+    delete_row_after_api_send: bool = True        # remove the SQLite row once the API send succeeds
+
     # individual columns - each can be turned off independently
     col_vehicle_image: bool = True
     col_vehicle_box: bool = True
@@ -288,6 +284,7 @@ class PipelineConfig:
     storage: StorageConfig = field(default_factory=StorageConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     features: FeaturesConfig = field(default_factory=FeaturesConfig)
+    api: ApiConfig = field(default_factory=ApiConfig)
 
     @classmethod
     def load(cls, yaml_path: Optional[str] = None) -> "PipelineConfig":
@@ -297,7 +294,7 @@ class PipelineConfig:
 
         # if no explicit path was given, look for "config.yaml" next to this file
         if yaml_path is None:
-            candidate = BASE_DIR / "config.yaml"
+            candidate = CONFIG_DIR / "config.yaml"
             yaml_path = str(candidate) if candidate.exists() else None
 
         # no file to load -> just return the defaults

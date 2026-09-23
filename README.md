@@ -16,22 +16,30 @@ time it, and put it in the buffer."
 
 ## 1. Project layout
 
-Each stage of the pipeline is now its own file instead of one 1800-line
-script, so a change to one stage can't accidentally break another:
+Each stage of the pipeline lives in its own folder by functionality, so a
+change to one stage can't accidentally break another:
 
-| File | Responsibility |
+| Folder / file | Responsibility |
 |---|---|
-| `config.py` | All tunable settings, loaded from `config.yaml` |
-| `camera.py` | Background-threaded RTSP reader, reconnect logic |
-| `detector.py` | YOLO model loading + inference (the only file that imports `ultralytics`) |
-| `tracker.py` | Stable vehicle IDs across frames + duplicate-vehicle suppression |
-| `geometry.py` | Box math (IoU, containment, cropping) |
-| `image_ops.py` | Image enhancement (contrast/denoise/sharpen) |
-| `timing.py` | Per-vehicle inference timing (vehicle detected -> plate crop finished) |
-| `storage.py` | SQLite buffer: schema, background batched writer |
-| `pipeline.py` | Wires the above together for one frame: detect -> crop -> detect -> crop -> store |
+| `config/config.py` | All tunable settings, loaded from `config/config.yaml` |
+| `config/config.yaml` | The file you actually edit day-to-day |
+| `config/bytetrack_custom.yaml` | ByteTrack tuning, referenced from `config.py` |
+| `camera/camera.py` | Background-threaded RTSP reader, reconnect logic |
+| `detection/detector.py` | YOLO model loading + inference (the only file that imports `ultralytics`) |
+| `detection/tracker.py` | Stable vehicle IDs across frames + duplicate-vehicle suppression |
+| `detection/geometry.py` | Box math (IoU, containment, cropping) |
+| `detection/image_ops.py` | Image enhancement (contrast/denoise/sharpen) |
+| `pipeline/pipeline.py` | Wires everything together for one frame: detect -> crop -> detect -> crop -> store |
+| `pipeline/timing.py` | Per-vehicle stage timing (vehicle/plate detect + crop, ms) |
+| `storage/storage.py` | SQLite buffer: schema, background batched writer, optional API hand-off |
+| `api/api_client.py` | Placeholder POST to the C# dashboard's API (`features.send_via_api`) |
 | `run.py` | Entry point: CLI args, main loop, graceful shutdown |
 | `export_openvino.py` | One-off utility: convert a `.pt` model to a faster OpenVINO export |
+
+Every folder is a plain Python package (`__init__.py` inside), imported as
+`from config.config import PipelineConfig`, `from detection import detector`,
+etc. Run everything from the project root (`python3 run.py`) so those
+imports resolve.
 
 Every line inside these files has an inline comment explaining what it does
 and why - read `pipeline.py` first, it's the one that ties everything
@@ -57,7 +65,7 @@ pip install opencv-python-headless
 
 ## 3. Configuration
 
-Edit `config.yaml` (see the comments inside it for every option). At minimum,
+Edit `config/config.yaml` (see the comments inside it for every option). At minimum,
 for live deployment set:
 
 ```yaml
@@ -144,7 +152,7 @@ while (reader.Read()) {
 ```
 
 On-disk JPEG copies of every crop are also written under `output/` (toggle
-with `storage.save_images_to_disk` in `config.yaml`) purely for manual
+with `features.save_images_to_disk` in `config/config.yaml`) purely for manual
 spot-checking; the database is the source of truth for the dashboard.
 
 ---
@@ -175,13 +183,13 @@ which runs noticeably faster on the Pi 5's CPU:
 ```bash
 python export_openvino.py --weights models/vehicle.pt --imgsz 480 --benchmark --image sample.jpg
 ```
-Point `config.yaml`'s `model.vehicle_weights` / `model.plate_weights` at the
+Point `config/config.yaml`'s `model.vehicle_weights` / `model.plate_weights` at the
 resulting folder.
 
 **Important:** a static-shape OpenVINO export only accepts exactly the size
 it was exported at - feed it anything else and inference throws a shape-
 mismatch error. If you re-export a model at a different `--imgsz`, update
-`model.vehicle_imgsz` / `model.plate_imgsz` in `config.yaml` to match, or the
+`model.vehicle_imgsz` / `model.plate_imgsz` in `config/config.yaml` to match, or the
 pipeline will crash on the first real frame. The two shipped models in
 `models/` were exported at 480 (vehicle) and 640 (plate), which is why those
 are the config defaults.
