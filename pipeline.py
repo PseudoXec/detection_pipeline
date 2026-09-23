@@ -28,7 +28,7 @@ import numpy as np
 import detector
 import image_ops
 from config import PipelineConfig
-from geometry import crop_vehicle, crop_plate, is_inside_roi, compute_containment, compute_iou
+from geometry import crop_vehicle, crop_plate, is_inside_roi, compute_containment, compute_iou, box_edges
 from storage import DetectionStorage, DetectionRecord
 from timing import VehicleTiming
 from tracker import FallbackTracker, PositionDeduper, needs_fallback_tracker
@@ -193,9 +193,19 @@ class DetectionPipeline:
         plate_confidence: Optional[float] = None
         plate_image_bytes: Optional[bytes] = None
         plate_detected = False
+        # plate box edges are relative to the VEHICLE CROP (same pixel space
+        # as vehicle_image_jpeg) since that's what the plate model actually
+        # saw; None until/unless a plate is actually found below
+        plate_x1: Optional[float] = None
+        plate_y1: Optional[float] = None
+        plate_x2: Optional[float] = None
+        plate_y2: Optional[float] = None
 
         if plate_predictions:
             best_plate = max(plate_predictions, key=lambda p: p.get("confidence", 0.0))
+            # raw detection box edges, in the vehicle crop's own pixel space -
+            # exactly what's needed to draw a rectangle on the stored vehicle_image
+            plate_x1, plate_y1, plate_x2, plate_y2 = box_edges(best_plate)
             plate_crop = crop_plate(vehicle_crop, best_plate, crop_cfg.plate_padding_pixels, crop_cfg.plate_min_crop_height)
             if plate_crop is not None:
                 if preprocess_cfg.enhance_plate_crop:
@@ -205,8 +215,16 @@ class DetectionPipeline:
                 plate_detected = True
                 if self.config.storage.save_images_to_disk:
                     self._write_crop_to_disk("plate_detection", f"{track_id}_plate", plate_crop)
+            else:
+                # detection fired but the crop itself failed (degenerate box) -
+                # don't report box coordinates for a plate we didn't actually save
+                plate_x1 = plate_y1 = plate_x2 = plate_y2 = None
 
         timing.mark_finished()
+
+        # vehicle box edges, in the ORIGINAL FULL FRAME's pixel space - what's
+        # needed to draw this vehicle's box back onto the full camera frame
+        vehicle_x1, vehicle_y1, vehicle_x2, vehicle_y2 = box_edges(base_prediction)
 
         record = DetectionRecord(
             track_id=track_id,
@@ -214,9 +232,17 @@ class DetectionPipeline:
             vehicle_class=str(base_prediction.get("class") or "vehicle"),
             vehicle_confidence=float(base_prediction.get("confidence", 0.0)),
             vehicle_image_jpeg=image_ops.encode_jpeg(vehicle_crop, self.config.storage.jpeg_quality),
+            vehicle_box_x1=vehicle_x1,
+            vehicle_box_y1=vehicle_y1,
+            vehicle_box_x2=vehicle_x2,
+            vehicle_box_y2=vehicle_y2,
             plate_detected=plate_detected,
             plate_confidence=plate_confidence,
             plate_image_jpeg=plate_image_bytes,
+            plate_box_x1=plate_x1,
+            plate_box_y1=plate_y1,
+            plate_box_x2=plate_x2,
+            plate_box_y2=plate_y2,
             detected_at=datetime.now(),
             vehicle_crop_ms=timing.vehicle_crop_ms,
             plate_detect_ms=timing.plate_detect_ms,

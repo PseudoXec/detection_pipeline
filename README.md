@@ -103,6 +103,11 @@ this pipeline keeps writing - no file locking conflicts.
 
 ### Table: `detections`
 
+> If you're upgrading from an older copy of this pipeline, the schema below
+> added new `NOT NULL` box-coordinate columns. `CREATE TABLE IF NOT EXISTS`
+> won't retrofit an existing database file, so run `python reset_buffer.py`
+> once after upgrading to start with a fresh, matching schema.
+
 | Column | Type | Meaning |
 |---|---|---|
 | `id` | INTEGER | primary key |
@@ -111,9 +116,11 @@ this pipeline keeps writing - no file locking conflicts.
 | `vehicle_class` | TEXT | e.g. `car`, `truck`, `motorcycle` |
 | `vehicle_confidence` | REAL | vehicle model confidence, 0-1 |
 | `vehicle_image` | BLOB | JPEG bytes of the vehicle crop |
+| `vehicle_box_x1/y1/x2/y2` | REAL | vehicle box pixel edges **in the full camera frame** - draw this on the original frame |
 | `plate_detected` | INTEGER | 0 or 1 |
 | `plate_confidence` | REAL (nullable) | plate model confidence, 0-1; NULL if no plate |
 | `plate_image` | BLOB (nullable) | JPEG bytes of the plate crop; NULL if no plate |
+| `plate_box_x1/y1/x2/y2` | REAL (nullable) | plate box pixel edges **in the vehicle crop** (i.e. relative to `vehicle_image`, not the full frame) - draw this on top of the vehicle image; NULL if no plate |
 | `detected_at` | TEXT | ISO-8601 timestamp the vehicle was first seen |
 | `vehicle_crop_ms` | REAL | time to crop the vehicle after detection |
 | `plate_detect_ms` | REAL | time spent running the plate model |

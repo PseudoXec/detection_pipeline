@@ -44,9 +44,24 @@ class DetectionRecord:
     vehicle_class: str
     vehicle_confidence: float
     vehicle_image_jpeg: bytes            # JPEG bytes of the vehicle crop
+    # pixel edges (left, top, right, bottom) of the vehicle box IN THE
+    # ORIGINAL FULL CAMERA FRAME - lets the dashboard draw the box on the
+    # full frame, or know where in the scene this vehicle was
+    vehicle_box_x1: float
+    vehicle_box_y1: float
+    vehicle_box_x2: float
+    vehicle_box_y2: float
     plate_detected: bool
     plate_confidence: Optional[float]    # None if no plate was found
     plate_image_jpeg: Optional[bytes]    # None if no plate was found
+    # pixel edges (left, top, right, bottom) of the plate box IN THE
+    # VEHICLE CROP (i.e. relative to `vehicle_image_jpeg`, not the full
+    # frame) - lets the dashboard draw a rectangle around the plate on top
+    # of the stored vehicle image. None if no plate was found.
+    plate_box_x1: Optional[float]
+    plate_box_y1: Optional[float]
+    plate_box_x2: Optional[float]
+    plate_box_y2: Optional[float]
     detected_at: datetime                # wall-clock time the vehicle was first seen
     vehicle_crop_ms: Optional[float]
     plate_detect_ms: Optional[float]
@@ -63,9 +78,17 @@ CREATE TABLE IF NOT EXISTS detections (
     vehicle_class       TEXT NOT NULL,
     vehicle_confidence  REAL NOT NULL,
     vehicle_image       BLOB NOT NULL,
+    vehicle_box_x1      REAL NOT NULL,          -- vehicle box, pixel coords in the FULL FRAME
+    vehicle_box_y1      REAL NOT NULL,
+    vehicle_box_x2      REAL NOT NULL,
+    vehicle_box_y2      REAL NOT NULL,
     plate_detected      INTEGER NOT NULL,       -- 0 or 1
     plate_confidence    REAL,                   -- NULL if plate_detected = 0
     plate_image         BLOB,                   -- NULL if plate_detected = 0
+    plate_box_x1        REAL,                   -- plate box, pixel coords in the VEHICLE CROP
+    plate_box_y1        REAL,                   -- (i.e. relative to vehicle_image, not the full frame)
+    plate_box_x2        REAL,                   -- all four NULL if plate_detected = 0
+    plate_box_y2        REAL,
     detected_at         TEXT NOT NULL,          -- ISO-8601 timestamp
     vehicle_crop_ms     REAL,
     plate_detect_ms     REAL,
@@ -170,9 +193,17 @@ class DetectionStorage:
                 record.vehicle_class,
                 record.vehicle_confidence,
                 record.vehicle_image_jpeg,
+                record.vehicle_box_x1,
+                record.vehicle_box_y1,
+                record.vehicle_box_x2,
+                record.vehicle_box_y2,
                 1 if record.plate_detected else 0,
                 record.plate_confidence,
                 record.plate_image_jpeg,
+                record.plate_box_x1,
+                record.plate_box_y1,
+                record.plate_box_x2,
+                record.plate_box_y2,
                 record.detected_at.isoformat(sep=" ", timespec="seconds"),
                 record.vehicle_crop_ms,
                 record.plate_detect_ms,
@@ -187,10 +218,12 @@ class DetectionStorage:
                     """
                     INSERT INTO detections (
                         track_id, camera_source, vehicle_class, vehicle_confidence,
-                        vehicle_image, plate_detected, plate_confidence, plate_image,
+                        vehicle_image, vehicle_box_x1, vehicle_box_y1, vehicle_box_x2, vehicle_box_y2,
+                        plate_detected, plate_confidence, plate_image,
+                        plate_box_x1, plate_box_y1, plate_box_x2, plate_box_y2,
                         detected_at, vehicle_crop_ms, plate_detect_ms, plate_crop_ms,
                         total_pipeline_ms
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     rows,
                 )
