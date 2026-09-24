@@ -136,5 +136,5 @@ live:
 
   # push mode (features.live_boxes)
   endpoint_url: null # e.g. "http://server:8000/api/live/boxes"
-  max_hz: 10
+  max_hz: 60
   timeout_seconds: 1.0
