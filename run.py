@@ -92,6 +92,7 @@ def run_on_stream(pipeline: DetectionPipeline, config: PipelineConfig) -> None:
         buffer_size=config.camera.capture_buffer_size,
         reconnect_delay_seconds=config.camera.reconnect_delay_seconds,
         max_reconnect_attempts=config.camera.max_reconnect_attempts,
+        max_fps=config.camera.max_fps,
     ).start()
 
     # live view: frames come straight from the camera thread (smooth video even
@@ -187,21 +188,32 @@ def run_on_stream(pipeline: DetectionPipeline, config: PipelineConfig) -> None:
             cv2.destroyAllWindows()
 
 
-def start_retention_housekeeping(storage: DetectionStorage, retention_days: int) -> None:
-    """Once a day, delete rows the dashboard has already marked synced=1 that
-    are older than `retention_days`, so the buffer database doesn't grow
-    forever on a device with limited storage like a Raspberry Pi's SD card."""
-    if retention_days <= 0:
+def start_retention_housekeeping(storage: DetectionStorage, retention_days: int, max_unsynced_days: int = 0) -> None:
+    """Keeps the buffer from growing forever on a device with limited storage (SD card):
+
+      * synced rows older than `retention_days` are deleted;
+      * on-disk JPEG copies older than `retention_days` are deleted;
+      * (optional) rows that were never delivered are dropped after `max_unsynced_days`.
+
+    Runs once right away and then every 6 hours. It used to sleep 24 h before its first
+    pass, which a Pi that gets rebooted or power-cycled more often than that never reached."""
+    if retention_days <= 0 and max_unsynced_days <= 0:
         return
 
     def loop():
         while True:
-            time.sleep(24 * 60 * 60)
-            deleted = storage.delete_synced_older_than(retention_days)
-            if deleted:
-                log.info("retention cleanup: removed %d old synced row(s)", deleted)
+            try:
+                deleted = storage.delete_synced_older_than(retention_days)
+                unsynced = storage.delete_unsynced_older_than(max_unsynced_days)
+                files = storage.sweep_output_dir(retention_days)
+                if deleted or unsynced or files:
+                    log.info("retention cleanup: removed %d synced row(s), %d undelivered row(s), %d image file(s)",
+                             deleted, unsynced, files)
+            except Exception as error:      # never let housekeeping die silently
+                log.warning("retention cleanup failed: %s", error)
+            time.sleep(6 * 60 * 60)
 
-    threading.Thread(target=loop, daemon=True).start()
+    threading.Thread(target=loop, name="retention", daemon=True).start()
 
 
 def main() -> None:
@@ -218,6 +230,10 @@ def main() -> None:
 
     setup_logging(config.runtime.log_level)
 
+    # OpenCV otherwise spins up a thread per core for resize/colour/CLAHE and competes with
+    # the model + RTSP decoder for the same 4 cores
+    cv2.setNumThreads(max(1, config.runtime.opencv_threads))
+
     storage = DetectionStorage(
         database_path=config.storage.database_path,
         batch_size=config.storage.write_batch_size,
@@ -226,8 +242,11 @@ def main() -> None:
         delete_row_after_api_send=config.features.delete_row_after_api_send,
         api_endpoint_url=config.api.endpoint_url,
         api_timeout_seconds=config.api.timeout_seconds,
+        output_dir=config.storage.output_dir if config.features.save_images_to_disk else None,
+        delete_disk_images_after_send=config.storage.delete_disk_images_after_send,
+        send_retry_seconds=config.storage.send_retry_seconds,
     ).start()
-    start_retention_housekeeping(storage, config.storage.retention_days)
+    start_retention_housekeeping(storage, config.storage.retention_days, config.storage.max_unsynced_days)
 
     camera_source = config.camera.rtsp_url or config.camera.folder or config.camera.image or "unknown"
     pipeline = DetectionPipeline(config, storage, camera_source)

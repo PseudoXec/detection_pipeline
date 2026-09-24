@@ -186,15 +186,25 @@ python export_openvino.py --weights models/vehicle.pt --imgsz 480 --benchmark --
 Point `config/config.yaml`'s `model.vehicle_weights` / `model.plate_weights` at the
 resulting folder.
 
-**Important:** a static-shape OpenVINO export only accepts exactly the size
-it was exported at - feed it anything else and inference throws a shape-
-mismatch error. If you re-export a model at a different `--imgsz`, update
-`model.vehicle_imgsz` / `model.plate_imgsz` in `config/config.yaml` to match, or the
-pipeline will crash on the first real frame. The two shipped models in
-`models/` were exported at 480 (vehicle) and 640 (plate), which is why those
-are the config defaults.
+**Important:** a static-shape export only accepts exactly the size it was
+exported at - feed it anything else and inference throws a shape-mismatch
+error. The vehicle model is now exported as a **rectangle**, `[height, width]`:
 
----
+```python
+from ultralytics import YOLO
+YOLO("models/vehicle.pt").export(format="onnx", imgsz=(512, 896))   # (height, width)
+```
+
+and `config.yaml` says `model.vehicle_imgsz: [512, 896]`. The pipeline no longer
+feeds it the whole frame: it cuts out the ROI plus `roi.crop_margin` (a window that
+is exactly 896x512 px on a 1280x720 stream with the default ROI), runs the model on
+that, and shifts the boxes back to full-frame pixels. If you change the ROI or the
+margin, the window changes shape automatically; re-export only if you want a
+different model input size. Set `features.roi_crop_detect: false` to go back to
+whole-frame detection. The plate model is still square 640.
+
+Note: OpenVINO is **not** faster than ONNX Runtime on the Pi 5 (an ARM CPU) -
+Ultralytics' own Pi 5 benchmark shows the opposite. Prefer `.onnx` or NCNN there.
 
 ## 9. Live view (frames + boxes for the command center)
 

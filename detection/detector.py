@@ -46,11 +46,30 @@ def weights_exist(path: str) -> bool:
 
 
 def resolve_inference_threads(configured: int) -> int:
-    """0 = auto: about the physical core count minus one (half the logical
-    cores, minus one), never below 2. Anything above 0 is used as given."""
+    """0 = auto: every core but one (the last core is left for the RTSP
+    decoder + HTTP threads), never below 2. Anything above 0 is used as given.
+
+    A Raspberry Pi 5 has 4 PHYSICAL cores and no SMT, so os.cpu_count() is
+    already the physical count. (The old formula halved it as if hyperthreading
+    were present, which left inference on only 2 of the 4 cores.)"""
     if configured > 0:
         return configured
-    return max(2, (os.cpu_count() or 4) // 2 - 1)
+    return max(2, (os.cpu_count() or 4) - 1)
+
+
+def normalize_imgsz(imgsz: "int | list | tuple") -> "int | List[int]":
+    """int -> int (square); [h, w] / (h, w) -> [h, w] (rectangular model)."""
+    if isinstance(imgsz, (list, tuple)):
+        if len(imgsz) == 1:
+            return int(imgsz[0])
+        return [int(imgsz[0]), int(imgsz[1])]
+    return int(imgsz)
+
+
+def imgsz_hw(imgsz: "int | list | tuple") -> Tuple[int, int]:
+    """(height, width) of a model input given as an int or an [h, w] pair."""
+    size = normalize_imgsz(imgsz)
+    return (size, size) if isinstance(size, int) else (size[0], size[1])
 
 
 def limit_onnx_threads(configured: int) -> Optional[int]:
@@ -96,6 +115,30 @@ def limit_onnx_threads(configured: int) -> Optional[int]:
     return threads
 
 
+def onnx_static_input_hw(weights_path: str) -> Optional[Tuple[int, int]]:
+    """(height, width) baked into a static-shape .onnx file, or None if the file is not
+    an .onnx / has a dynamic input / can't be inspected.
+
+    A static export accepts ONLY that size. The config's *_imgsz values used to have to be
+    kept in sync with the file by hand, and when they drifted every inference call failed
+    with "Got invalid dimensions for input" (which the pipeline then stored as "no plate")."""
+    if not (os.path.isfile(weights_path) and weights_path.lower().endswith(".onnx")):
+        return None
+    try:
+        import onnxruntime as ort
+        options = ort.SessionOptions()
+        options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL   # we only want the shape: skip the optimizer
+        options.intra_op_num_threads = 1
+        session = ort.InferenceSession(weights_path, options, providers=["CPUExecutionProvider"])
+        shape = session.get_inputs()[0].shape                      # [batch, 3, H, W]
+        height, width = shape[2], shape[3]
+        if isinstance(height, int) and isinstance(width, int):
+            return height, width
+    except Exception:
+        pass
+    return None
+
+
 def load_model(weights_path: str, device: Optional[str] = None) -> YOLO:
     """Load a YOLO model, whether it's a raw .pt checkpoint, an OpenVINO
     export, or an NCNN export.
@@ -125,15 +168,15 @@ def load_model(weights_path: str, device: Optional[str] = None) -> YOLO:
     return model
 
 
-def warmup_model(model: YOLO, imgsz: int, frame_shape: Optional[Tuple[int, int]] = None) -> None:
+def warmup_model(model: YOLO, imgsz: "int | list | tuple", frame_shape: Optional[Tuple[int, int]] = None) -> None:
     """Run one throwaway inference so the real, first camera frame isn't slowed
     down by model/graph initialization costs."""
     # use the real capture resolution if we know it, otherwise fall back to imgsz
-    height, width = frame_shape if frame_shape else (imgsz, imgsz)
+    height, width = frame_shape if frame_shape else imgsz_hw(imgsz)
     # a black frame is enough - we only care about paying the startup cost
     dummy_frame = np.zeros((height, width, 3), dtype=np.uint8)
     try:
-        model.predict(source=dummy_frame, imgsz=imgsz, verbose=False)
+        model.predict(source=dummy_frame, imgsz=normalize_imgsz(imgsz), verbose=False)
     except Exception as error:  # pragma: no cover - warmup failures are non-fatal
         print(f"[warn] model warm-up failed (continuing anyway): {error}")
 
@@ -180,7 +223,7 @@ def detect(
     """Run the model on ONE image (file path or in-memory frame)."""
     try:
         # a single call handles both str paths and numpy arrays transparently
-        results = model.predict(source=image, conf=conf_threshold, iou=iou_threshold, imgsz=imgsz, verbose=False)
+        results = model.predict(source=image, conf=conf_threshold, iou=iou_threshold, imgsz=normalize_imgsz(imgsz), verbose=False)
     except Exception as error:
         raise InferenceError(f"Detection failed: {error}") from error
 
@@ -221,7 +264,7 @@ def detect_batch(
     results = None
     if len(batch_images) == 1 or not getattr(model, "_batch_predict_unsupported", False):
         try:
-            results = model.predict(source=batch_images, conf=conf_threshold, iou=iou_threshold, imgsz=imgsz, verbose=False)
+            results = model.predict(source=batch_images, conf=conf_threshold, iou=iou_threshold, imgsz=normalize_imgsz(imgsz), verbose=False)
         except Exception as error:
             if len(batch_images) == 1:
                 raise InferenceError(f"Batch detection failed on 1 image: {error}") from error
@@ -233,7 +276,7 @@ def detect_batch(
         try:
             results = []
             for image in batch_images:
-                results.extend(model.predict(source=[image], conf=conf_threshold, iou=iou_threshold, imgsz=imgsz, verbose=False))
+                results.extend(model.predict(source=[image], conf=conf_threshold, iou=iou_threshold, imgsz=normalize_imgsz(imgsz), verbose=False))
         except Exception as error:
             raise InferenceError(f"Batch detection failed on {len(batch_images)} image(s): {error}") from error
 
@@ -251,19 +294,36 @@ def track(
     frame: np.ndarray,
     conf_threshold: float,
     iou_threshold: float,
-    imgsz: int,
+    imgsz: "int | list | tuple",
     tracker_config: str,
     classes: Optional[Set[str]] = None,
+    region: Optional[Tuple[int, int, int, int]] = None,
 ) -> List[Dict[str, Any]]:
     """Run persistent ByteTrack tracking on one live video frame.
 
     `persist=True` tells Ultralytics to remember track state between calls,
     which is what gives each vehicle a stable ID across frames instead of a
     fresh ID every time.
+
+    `region` = (x1, y1, x2, y2) in full-frame pixels. When given, ONLY that
+    window is fed to the model (the ROI + margin; see
+    geometry.compute_detect_region) and the returned boxes are shifted back
+    into FULL-FRAME pixels, so callers never know a crop happened. ByteTrack
+    sees crop coordinates, which differ from frame coordinates by a constant
+    offset, so tracking is unaffected.
     """
+    source = frame
+    offset_x = offset_y = 0
+    if region is not None:
+        region_x1, region_y1, region_x2, region_y2 = region
+        if region_x2 > region_x1 and region_y2 > region_y1:
+            # contiguous copy: a slice is a strided view, and OpenCV/ONNX preprocessing wants a dense array
+            source = np.ascontiguousarray(frame[region_y1:region_y2, region_x1:region_x2])
+            offset_x, offset_y = region_x1, region_y1
+
     try:
         results = model.track(
-            source=frame, conf=conf_threshold, iou=iou_threshold, imgsz=imgsz,
+            source=source, conf=conf_threshold, iou=iou_threshold, imgsz=normalize_imgsz(imgsz),
             tracker=tracker_config, persist=True, verbose=False,
         )
     except Exception as error:
@@ -290,7 +350,8 @@ def track(
         if classes and class_name not in classes:
             continue
         prediction = {
-            "x": float(cx), "y": float(cy), "width": float(width), "height": float(height),
+            "x": float(cx) + offset_x, "y": float(cy) + offset_y,
+            "width": float(width), "height": float(height),
             "class": class_name, "confidence": float(confidence),
         }
         if track_id is not None:

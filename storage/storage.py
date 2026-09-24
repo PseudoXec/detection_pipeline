@@ -29,10 +29,18 @@ import threading
 import time
 # datetime gives us a human-readable, sortable timestamp for each row
 from datetime import datetime, timedelta
+import logging
 # os.makedirs ensures the database's parent folder exists before SQLite opens it
 import os
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Dict, List, Optional
+
+log = logging.getLogger("pipeline")
+
+# a row whose POST keeps failing is retried this many times, then left alone
+# (until restart) so one poisoned row can't block the rows behind it forever
+_MAX_SEND_RETRIES = 5
+_RETRY_BATCH_ROWS = 50
 
 
 @dataclass
@@ -70,6 +78,10 @@ class DetectionRecord:
     total_pipeline_ms: Optional[float]   # sum of whichever stages above were measured
     ocr_process: bool                    # True if an OCR read was attempted on the plate crop
     ocr_read: str                        # recognized plate text, or "Unrecognized" if it couldn't be read
+    # optional spot-check copies: {path relative to output_dir: JPEG bytes}. The writer
+    # thread puts them on disk (the detection loop no longer does), and removes them
+    # again once the record has been delivered.
+    disk_files: Optional[Dict[str, bytes]] = None
 
 
 # the exact table layout the C# dashboard will read from
@@ -124,6 +136,9 @@ class DetectionStorage:
         delete_row_after_api_send: bool = True,
         api_endpoint_url: Optional[str] = None,
         api_timeout_seconds: float = 5.0,
+        output_dir: Optional[str] = None,
+        delete_disk_images_after_send: bool = True,
+        send_retry_seconds: float = 60.0,
     ):
         self.database_path = database_path
         self.batch_size = batch_size
@@ -133,6 +148,11 @@ class DetectionStorage:
         self.delete_row_after_api_send = delete_row_after_api_send
         self.api_endpoint_url = api_endpoint_url
         self.api_timeout_seconds = api_timeout_seconds
+        self.output_dir = output_dir
+        self.delete_disk_images_after_send = delete_disk_images_after_send
+        self.send_retry_seconds = send_retry_seconds
+        # row id -> failed retry count (in memory only; bounded by the number of undelivered rows)
+        self._retry_failures: Dict[int, int] = {}
 
         # make sure the folder for the .db file actually exists first
         os.makedirs(os.path.dirname(os.path.abspath(database_path)) or ".", exist_ok=True)
@@ -191,6 +211,7 @@ class DetectionStorage:
         SQLite transaction at a time."""
         connection = self._connect()
         last_flush = time.time()
+        next_retry = time.time() + self.send_retry_seconds
         pending: List[DetectionRecord] = []
 
         while not self._stop_event.is_set() or not self._queue.empty() or pending:
@@ -210,12 +231,26 @@ class DetectionStorage:
                 pending = []
                 last_flush = time.time()
 
+            # API mode: re-send rows whose POST failed earlier (server was down, timeout...).
+            # Only when nothing fresh is waiting, and never while shutting down.
+            if (self.send_via_api and self.api_endpoint_url and not self._stop_event.is_set()
+                    and self._queue.empty() and not pending and time.time() >= next_retry):
+                try:
+                    self._retry_unsent(connection)
+                except Exception as error:      # housekeeping must never kill the writer thread
+                    log.warning("[storage] retry pass failed: %s", error)
+                next_retry = time.time() + self.send_retry_seconds
+
         connection.close()
 
     def _write_batch(self, connection: sqlite3.Connection, records: List[DetectionRecord]) -> None:
         """Insert a batch of records (one INSERT per record, in one
         transaction, so we can capture each row's own id) then, if
         `send_via_api` is on, POST each record and delete its row on success."""
+        # spot-check JPEG copies go to disk from HERE (writer thread), not the detection loop
+        for record in records:
+            self._write_disk_files(record)
+
         inserted_ids: List[int] = []
         try:
             with connection:  # commits automatically on success, rolls back on error
@@ -256,21 +291,151 @@ class DetectionStorage:
     def _send_and_maybe_delete(
         self, connection: sqlite3.Connection, records: List[DetectionRecord], row_ids: List[int],
     ) -> None:
-        """PLACEHOLDER API hand-off: POST each just-written record to the
-        C# dashboard's API; if that succeeds AND `delete_row_after_api_send`
-        is on, remove its SQLite row immediately instead of waiting for the
-        dashboard's own sync/delete pass. On failure the row is simply left
-        in place (synced=0) so the normal SQLite hand-off still covers it."""
+        """API hand-off: POST each just-written record to the C# dashboard.
+
+          SENT    -> the row is DONE: deleted (delete_row_after_api_send) or marked synced=1,
+                     and its on-disk JPEG copies are removed.
+          SKIPPED -> no plate, so nothing to send. Marked synced=1 so the normal retention
+                     sweep removes it after `retention_days` (it used to stay synced=0 forever).
+          FAILED  -> left synced=0; `_retry_unsent` tries again later.
+        """
         from api import api_client  # imported here to avoid a hard dependency when the feature is off
 
-        sent_ids = []
+        sent_ids: List[int] = []
+        skipped_ids: List[int] = []
         for record, row_id in zip(records, row_ids):
-            if api_client.send_detection(record, self.api_endpoint_url, self.api_timeout_seconds):
+            result = api_client.send_detection(record, self.api_endpoint_url, self.api_timeout_seconds)
+            if result == api_client.SendResult.SENT:
                 sent_ids.append(row_id)
+                if self.delete_disk_images_after_send:
+                    self._delete_disk_files(record)
+            elif result == api_client.SendResult.SKIPPED:
+                skipped_ids.append(row_id)
+        self._finish_rows(connection, sent_ids, skipped_ids)
 
-        if sent_ids and self.delete_row_after_api_send:
+    def _finish_rows(self, connection: sqlite3.Connection, sent_ids: List[int], skipped_ids: List[int]) -> None:
+        """Close out rows that no longer need delivering."""
+        if not sent_ids and not skipped_ids:
+            return
+        with connection:
+            if sent_ids:
+                if self.delete_row_after_api_send:
+                    connection.executemany("DELETE FROM detections WHERE id = ?", [(rid,) for rid in sent_ids])
+                else:
+                    connection.executemany("UPDATE detections SET synced = 1 WHERE id = ?", [(rid,) for rid in sent_ids])
+            if skipped_ids:
+                connection.executemany("UPDATE detections SET synced = 1 WHERE id = ?", [(rid,) for rid in skipped_ids])
+
+    def _retry_unsent(self, connection: sqlite3.Connection) -> None:
+        """Re-send plate rows that are still synced=0 (earlier POST failed), and
+        close out no-plate rows an older version left synced=0 forever."""
+        from api import api_client
+
+        # legacy / leftover rows that can never be sent: mark them so retention can remove them
+        leftovers = [row[0] for row in connection.execute(
+            "SELECT id FROM detections WHERE synced = 0 AND plate_detected = 0")]
+        self._finish_rows(connection, [], leftovers)
+
+        connection.row_factory = sqlite3.Row
+        try:
+            rows = connection.execute(
+                "SELECT * FROM detections WHERE synced = 0 AND plate_detected = 1 ORDER BY id LIMIT ?",
+                (_RETRY_BATCH_ROWS,),
+            ).fetchall()
+        finally:
+            connection.row_factory = None
+
+        sent_ids: List[int] = []
+        for row in rows:
+            row_id = row["id"]
+            if self._retry_failures.get(row_id, 0) >= _MAX_SEND_RETRIES:
+                continue
+            result = api_client.send_detection(self._row_to_record(row), self.api_endpoint_url, self.api_timeout_seconds)
+            if result == api_client.SendResult.FAILED:
+                self._retry_failures[row_id] = self._retry_failures.get(row_id, 0) + 1
+                break            # server probably still down - try again next cycle instead of hammering it
+            sent_ids.append(row_id)
+            self._retry_failures.pop(row_id, None)
+        self._finish_rows(connection, sent_ids, [])
+        if sent_ids:
+            log.info("[storage] re-sent %d earlier failed record(s)", len(sent_ids))
+
+    @staticmethod
+    def _row_to_record(row: sqlite3.Row) -> DetectionRecord:
+        """Rebuild the fields the API needs from a stored row."""
+        return DetectionRecord(
+            track_id=row["track_id"], camera_source=row["camera_source"],
+            vehicle_class=row["vehicle_class"], vehicle_confidence=row["vehicle_confidence"],
+            vehicle_image_jpeg=None,
+            vehicle_box_x1=row["vehicle_box_x1"], vehicle_box_y1=row["vehicle_box_y1"],
+            vehicle_box_x2=row["vehicle_box_x2"], vehicle_box_y2=row["vehicle_box_y2"],
+            plate_detected=bool(row["plate_detected"]), plate_confidence=row["plate_confidence"],
+            plate_image_jpeg=row["plate_image"],
+            plate_box_x1=row["plate_box_x1"], plate_box_y1=row["plate_box_y1"],
+            plate_box_x2=row["plate_box_x2"], plate_box_y2=row["plate_box_y2"],
+            detected_at=datetime.fromisoformat(row["detected_at"]),
+            vehicle_detect_ms=row["vehicle_detect_ms"], vehicle_crop_ms=row["vehicle_crop_ms"],
+            plate_detect_ms=row["plate_detect_ms"], plate_crop_ms=row["plate_crop_ms"],
+            total_pipeline_ms=row["total_pipeline_ms"],
+            ocr_process=bool(row["ocr_process"]), ocr_read=row["ocr_read"] or "Unrecognized",
+        )
+
+    # ------------------------------------------------------------------ #
+    # on-disk spot-check copies
+    # ------------------------------------------------------------------ #
+    def _write_disk_files(self, record: DetectionRecord) -> None:
+        if not self.output_dir or not record.disk_files:
+            return
+        for relative_path, data in record.disk_files.items():
+            try:
+                path = os.path.join(self.output_dir, relative_path)
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "wb") as handle:
+                    handle.write(data)
+            except OSError as error:
+                print(f"[storage] could not write {relative_path}: {error}")
+
+    def _delete_disk_files(self, record: DetectionRecord) -> None:
+        if not self.output_dir or not record.disk_files:
+            return
+        for relative_path in record.disk_files:
+            try:
+                os.remove(os.path.join(self.output_dir, relative_path))
+            except OSError:
+                pass
+
+    def sweep_output_dir(self, days: int) -> int:
+        """Delete spot-check JPEGs older than `days` (backstop for anything that was
+        never delivered/cleaned up, and for the non-API mode). Returns files removed."""
+        if days <= 0 or not self.output_dir or not os.path.isdir(self.output_dir):
+            return 0
+        cutoff = time.time() - days * 86400
+        removed = 0
+        for folder, _dirs, files in os.walk(self.output_dir):
+            for name in files:
+                path = os.path.join(folder, name)
+                try:
+                    if os.path.getmtime(path) < cutoff:
+                        os.remove(path)
+                        removed += 1
+                except OSError:
+                    pass
+        return removed
+
+    def delete_unsynced_older_than(self, days: int) -> int:
+        """Last-resort cap for rows that were never delivered. 0 = disabled."""
+        if days <= 0:
+            return 0
+        cutoff = (datetime.now() - timedelta(days=days)).isoformat(sep=" ", timespec="seconds")
+        connection = self._connect()
+        try:
             with connection:
-                connection.executemany("DELETE FROM detections WHERE id = ?", [(rid,) for rid in sent_ids])
+                cursor = connection.execute(
+                    "DELETE FROM detections WHERE synced = 0 AND detected_at < ?", (cutoff,),
+                )
+                return cursor.rowcount
+        finally:
+            connection.close()
 
     def delete_synced_older_than(self, days: int) -> int:
         """Housekeeping: remove rows the dashboard has already consumed

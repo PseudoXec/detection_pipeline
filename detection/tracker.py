@@ -145,6 +145,17 @@ class PositionDeduper:
             "saved_at": time.time(),
         }
 
+    def prune(self, max_age_seconds: float = 60.0) -> int:
+        """Forget saves that haven't been seen for `max_age_seconds`. Entries
+        older than the cooldown can never match anyway (see find_existing_track),
+        so without this the dict just grows for as long as the Pi stays up.
+        Returns how many entries were dropped."""
+        cutoff = time.time() - max(max_age_seconds, self.cooldown_seconds)
+        stale = [track_id for track_id, entry in self._recent_saves.items() if entry["saved_at"] < cutoff]
+        for track_id in stale:
+            del self._recent_saves[track_id]
+        return len(stale)
+
     def refresh(self, track_id: str, box: Dict[str, Any]) -> None:
         """Call this every frame a still-visible vehicle is re-detected, so a
         vehicle that dwells for a long time (traffic light) stays suppressed."""

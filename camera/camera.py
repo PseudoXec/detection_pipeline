@@ -71,8 +71,11 @@ class ThreadedRTSPCamera:
         buffer_size: int = 1,
         reconnect_delay_seconds: float = 5.0,
         max_reconnect_attempts: int = 0,
+        max_fps: float = 0.0,
     ):
         self.rtsp_url = rtsp_url
+        # 0 = keep every decoded frame; N = hand out at most N frames/second
+        self.max_fps = max_fps
         self.frame_width = frame_width
         self.frame_height = frame_height
         self.buffer_size = buffer_size
@@ -136,9 +139,23 @@ class ThreadedRTSPCamera:
     def _grab_loop(self) -> None:
         """Runs forever in the background thread until stop() is called."""
         consecutive_failures = 0
+        min_interval = 1.0 / self.max_fps if self.max_fps and self.max_fps > 0 else 0.0
+        last_kept = 0.0
 
         while not self._stop_event.is_set():
-            ok, frame = self._capture.read() if self._capture is not None else (False, None)
+            # read() = grab() (decode) + retrieve() (colour-convert + copy). H.264 needs
+            # every frame decoded, but a frame that will be dropped anyway can skip
+            # the convert + copy, which is what the max_fps cap does.
+            capture = self._capture
+            ok = capture.grab() if capture is not None else False
+            frame = None
+            if ok and min_interval:
+                now = time.monotonic()
+                if now - last_kept < min_interval * 0.85:
+                    continue                      # decoded, deliberately not kept
+                last_kept = now
+            if ok:
+                ok, frame = capture.retrieve()
 
             if not ok or frame is None:
                 consecutive_failures += 1

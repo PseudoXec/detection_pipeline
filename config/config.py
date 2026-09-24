@@ -18,7 +18,7 @@ import os
 # pathlib gives us clean, cross-platform path handling
 from pathlib import Path
 # typing hints make the config self-documenting
-from typing import Optional
+from typing import List, Optional, Union
 
 # PyYAML lets operators edit settings in a plain text file instead of code
 import yaml
@@ -55,6 +55,12 @@ class CameraConfig:
     # style errors in the original code).
     decode_threads: int = 2
 
+    # cap on frames handed to the pipeline / live view per second (0 = no cap).
+    # Frames above the cap are still decoded (H.264 needs every frame) but skip
+    # the colour conversion + copy. The best fix is still to lower the frame
+    # rate in the camera's own web UI, which cuts the decode itself.
+    max_fps: float = 0.0
+
     # seconds to wait between reconnect attempts after the stream drops
     reconnect_delay_seconds: float = 5.0
 
@@ -75,6 +81,11 @@ class RoiConfig:
     x_max: float = 0.85
     y_min: float = 0.15
     y_max: float = 0.90
+
+    # when features.roi_crop_detect is on, the vehicle model is fed only the
+    # ROI plus this much extra on every side (fraction of the frame), so a
+    # vehicle straddling the ROI edge is still seen whole and tracked steadily
+    crop_margin: float = 0.05
 
     # reject vehicle boxes that touch the very edge of the ROI (usually a
     # vehicle that is only half-visible, which gives a bad plate crop)
@@ -101,7 +112,7 @@ class ModelConfig:
     device: Optional[str] = None
 
     # CPU threads ONNX Runtime may use for the .onnx models (ignored by
-    # OpenVINO/NCNN/.pt). 0 = auto (about physical cores - 1, min 2);
+    # OpenVINO/NCNN/.pt). 0 = auto (cores - 1, min 2 -> 3 on a Pi 5);
     # -1 = no limit; N = exactly N. Lower = smoother video/live view but slower
     # detection; raise it if detection is too slow, lower it if the video stutters.
     inference_threads: int = 0
@@ -113,7 +124,9 @@ class ModelConfig:
     # accept 480x480 input. Feeding it 640x640 here throws a shape-mismatch
     # error from NCNN. These numbers MUST match whatever --imgsz you used
     # when exporting each model (see export_openvino.py / the ncnn export).
-    vehicle_imgsz: int = 480
+    # vehicle_imgsz may be an int (square) or [height, width] for a rectangular
+    # export, e.g. [512, 896] (see export_openvino.py / the README).
+    vehicle_imgsz: Union[int, List[int]] = 480
     plate_imgsz: int = 640
 
     # confidence / NMS thresholds per stage
@@ -143,8 +156,16 @@ class TrackingConfig:
     dedup_cooldown_seconds: float = 2.0
     dedup_position_threshold: float = 1.0   # in units of "vehicle widths"
 
-    # give up trying to find a plate after this many attempts for one vehicle
-    max_plate_attempts: int = 3
+    # plate-detection attempts per tracking ID. 1 = a NEW track id gets exactly
+    # one plate pass and every later frame with the SAME id is skipped. If you
+    # raise it, each retry re-crops the vehicle from the current frame (it used
+    # to re-run the model on the identical first-sighting crop, which can only
+    # ever give the same answer).
+    max_plate_attempts: int = 1
+
+    # forget a track (and free its crop) once it hasn't been seen for this long.
+    # A vehicle that vanishes before a plate was found is stored as "no plate".
+    track_ttl_seconds: float = 30.0
 
 
 @dataclass
@@ -214,8 +235,20 @@ class StorageConfig:
     write_flush_interval_seconds: float = 1.0
 
     # delete rows older than this many days that the dashboard has already
-    # marked as synced=1; 0 disables cleanup (keep forever)
+    # marked as synced=1; 0 disables cleanup (keep forever). The same age limit
+    # is applied to the on-disk JPEG copies under output_dir.
     retention_days: int = 14
+
+    # rows that were never delivered (dashboard/API down for a long time) are
+    # only deleted after this many days; 0 = keep them until they are sent
+    max_unsynced_days: int = 0
+
+    # API mode: remove a vehicle's on-disk JPEG copies as soon as its record
+    # has been delivered (or skipped because it has no plate)
+    delete_disk_images_after_send: bool = True
+
+    # API mode: how often to retry rows whose POST failed
+    send_retry_seconds: float = 60.0
 
 
 @dataclass
@@ -223,6 +256,9 @@ class RuntimeConfig:
     """Misc. operational knobs."""
 
     log_level: str = "INFO"
+    # threads OpenCV may use for resize/colour/CLAHE. Left at its default it
+    # grabs every core and fights the model + decoder for them.
+    opencv_threads: int = 2
     # finite run for testing; 0 = run forever (production/24-7 mode)
     max_frames: int = 0
 
@@ -291,6 +327,7 @@ class FeaturesConfig:
 
     # ---- pipeline stage / behavior toggles ----
     roi_filter: bool = True                    # drop detections outside the configured ROI
+    roi_crop_detect: bool = True               # feed the vehicle model only the ROI (+margin) window instead of the whole frame
     fallback_tracker: bool = True               # use the simple tracker when ByteTrack can't assign an ID
     position_dedup: bool = True                 # skip re-saving a vehicle that's just sitting still
     plate_detection: bool = True                # run the plate model at all (False = vehicles only)

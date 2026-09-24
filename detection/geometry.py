@@ -170,6 +170,47 @@ def crop_plate(
     return crop
 
 
+def compute_detect_region(
+    frame_shape: Tuple[int, int],
+    roi_x_min: float, roi_x_max: float, roi_y_min: float, roi_y_max: float,
+    margin_ratio: float,
+    target_hw: Optional[Tuple[int, int]] = None,
+) -> Tuple[int, int, int, int]:
+    """Pixel window (x1, y1, x2, y2) of the FULL frame that the vehicle model
+    should look at: the ROI plus a safety margin, grown to the model's aspect
+    ratio and clamped to the frame.
+
+    Everything outside the ROI is discarded by `is_inside_roi` anyway, so
+    running the model on the whole frame just burns CPU. The margin keeps
+    vehicles that are only partly inside the ROI whole (needed for stable
+    tracking); the aspect-ratio step means the crop maps onto the model's
+    static input (e.g. 512x896) with no distortion and, when the crop is the
+    same size as the input, with no rescaling at all.
+    """
+    frame_h, frame_w = frame_shape[:2]
+
+    left = max(0.0, roi_x_min - margin_ratio) * frame_w
+    right = min(1.0, roi_x_max + margin_ratio) * frame_w
+    top = max(0.0, roi_y_min - margin_ratio) * frame_h
+    bottom = min(1.0, roi_y_max + margin_ratio) * frame_h
+    width, height = right - left, bottom - top
+    if width <= 0 or height <= 0:
+        return 0, 0, frame_w, frame_h
+
+    if target_hw:
+        target_aspect = target_hw[1] / float(target_hw[0])       # width / height
+        if width / height < target_aspect:
+            width = height * target_aspect                       # too narrow -> widen
+        else:
+            height = width / target_aspect                       # too wide   -> heighten
+
+    center_x, center_y = (left + right) / 2.0, (top + bottom) / 2.0
+    width, height = min(width, float(frame_w)), min(height, float(frame_h))
+    left = min(max(center_x - width / 2.0, 0.0), frame_w - width)
+    top = min(max(center_y - height / 2.0, 0.0), frame_h - height)
+    return int(round(left)), int(round(top)), int(round(left + width)), int(round(top + height))
+
+
 def is_inside_roi(
     box: Dict[str, Any],
     frame_shape: Tuple[int, int],

@@ -15,26 +15,48 @@ Flow for a single frame:
                          per-vehicle timing) to the SQLite buffer
 """
 
-# os.path helpers are used for building on-disk output paths
-import os
+# logging is used for the (rare) housekeeping problems that must never stop the loop
+import logging
+# time.monotonic() drives track expiry
+import time
+# dataclass groups everything we remember about one tracked vehicle
+from dataclasses import dataclass
 # datetime timestamps every detection with a real wall-clock time
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
-# cv2.imwrite is used only when "save images to disk" is turned on in config
-import cv2
 import numpy as np
 
 from detection import detector
 from detection import image_ops
 from config.config import PipelineConfig
-from detection.geometry import crop_vehicle, crop_plate, is_inside_roi, compute_containment, compute_iou, box_edges
+from detection.geometry import crop_vehicle, crop_plate, is_inside_roi, compute_detect_region, box_edges
 from storage.storage import DetectionStorage, DetectionRecord
 from pipeline.timing import VehicleTiming, Stopwatch
 from detection.tracker import FallbackTracker, PositionDeduper, needs_fallback_tracker
 from ocr import PlateOCRReader
 from live.box_publisher import LiveBoxPublisher
 from live.live_server import LiveServer
+
+log = logging.getLogger("pipeline")
+
+# how often (seconds) expired tracks are swept out of memory
+_PRUNE_INTERVAL_SECONDS = 5.0
+
+
+@dataclass
+class _TrackState:
+    """Everything remembered about ONE tracking ID. Replaces four separate dicts
+    (crops / timings / attempts / finalized) that were never pruned - together they
+    held every vehicle crop ever seen, i.e. a memory leak on a 24/7 device."""
+
+    timing: VehicleTiming
+    crop: Optional[np.ndarray]          # vehicle crop the plate model runs on; freed once finalized
+    prediction: Dict[str, Any]          # latest vehicle box (full-frame pixels)
+    last_seen: float                    # time.monotonic() of the last frame this id was visible in
+    stem: str                           # unique file-name stem for the on-disk copies
+    attempts: int = 0                   # plate passes done so far
+    finalized: bool = False             # True = stored; every later frame with this id is skipped
 
 
 class DetectionPipeline:
@@ -59,6 +81,9 @@ class DetectionPipeline:
         self.vehicle_model = detector.load_model(config.model.vehicle_weights, config.model.device)
         print("[pipeline] loading plate model...")
         self.plate_model = detector.load_model(config.model.plate_weights, config.model.device)
+        # a static .onnx only accepts the size it was exported at: trust the FILE over the config
+        self._sync_imgsz_with_model("vehicle", config.model.vehicle_weights, "vehicle_imgsz")
+        self._sync_imgsz_with_model("plate", config.model.plate_weights, "plate_imgsz")
 
         # fallback tracker only actually used if ByteTrack fails to tag a track_id
         self.fallback_tracker = FallbackTracker(
@@ -115,12 +140,15 @@ class DetectionPipeline:
                 box_extrapolate_max_seconds=config.live.box_extrapolate_max_seconds,
             )
 
-        # per-track_id bookkeeping so we never re-save a crop we already have,
-        # and so we know how many times we've tried (and failed) to find a plate
-        self._saved_vehicle_crops: Dict[str, np.ndarray] = {}
-        self._plate_attempts: Dict[str, int] = {}
-        self._finalized_tracks: set = set()
-        self._timings: Dict[str, VehicleTiming] = {}
+        # per-track_id bookkeeping: NEW id -> processed once; SAME id again -> skipped.
+        # Entries are dropped `tracking.track_ttl_seconds` after the vehicle was last seen.
+        self._tracks: Dict[str, _TrackState] = {}
+        self._last_prune = time.monotonic()
+        # file names must not collide across restarts (track ids restart at v1 every run)
+        self._session_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
+        # window of the full frame the vehicle model actually sees (ROI + margin)
+        self._detect_region: Optional[Tuple[int, int, int, int]] = None
+        self._detect_region_shape: Optional[tuple] = None
         # ms the LAST vehicle-detect / plate-detect model call took, so every
         # vehicle that was part of that same call can be stamped with it
         self._last_vehicle_detect_ms: Optional[float] = None
@@ -130,27 +158,83 @@ class DetectionPipeline:
         classes = config.model.vehicle_classes
         self.vehicle_classes = {c.strip() for c in classes.split(",") if c.strip()} if classes else None
 
-        if config.features.save_images_to_disk:
-            os.makedirs(os.path.join(config.storage.output_dir, "vehicle_detection"), exist_ok=True)
-            os.makedirs(os.path.join(config.storage.output_dir, "plate_detection"), exist_ok=True)
-
     def warmup(self, frame_shape: Optional[tuple] = None) -> None:
         """Run one throwaway inference per model before the real loop starts."""
         print("[pipeline] warming up models...")
+        # with ROI-crop detection the model sees the region, not the whole frame
+        region = self._get_detect_region(frame_shape) if frame_shape else None
+        if region is not None:
+            frame_shape = (region[3] - region[1], region[2] - region[0])
         detector.warmup_model(self.vehicle_model, self.config.model.vehicle_imgsz, frame_shape)
         detector.warmup_model(self.plate_model, self.config.model.plate_imgsz)
+        self._plate_self_test()
+
+    def _sync_imgsz_with_model(self, label: str, weights: str, attribute: str) -> None:
+        """If the model file is a static-shape .onnx whose size differs from
+        model.<attribute> in the config, use the file's size and say so loudly."""
+        actual = detector.onnx_static_input_hw(weights)
+        if actual is None:
+            return
+        configured = detector.imgsz_hw(getattr(self.config.model, attribute))
+        if actual != configured:
+            log.warning(
+                "[pipeline] %s model %s is a static %dx%d (HxW) export but model.%s is %dx%d - "
+                "using %dx%d so inference works. Re-export the model at the size you intend, or fix model.%s.",
+                label, weights, actual[0], actual[1], attribute, configured[0], configured[1],
+                actual[0], actual[1], attribute)
+            setattr(self.config.model, attribute, [actual[0], actual[1]])
+
+    def _plate_self_test(self) -> None:
+        """Run the plate model through the SAME call the live loop uses for every
+        vehicle, once, at startup. If that call is broken, every vehicle would be
+        stored as "no plate" - better to find out in the first second than from the DB."""
+        model_cfg = self.config.model
+        if not self.config.features.plate_detection:
+            log.warning("features.plate_detection is OFF - every vehicle will be stored WITHOUT a plate")
+            return
+        dummy_crop = np.zeros((300, 400, 3), dtype=np.uint8)
+        try:
+            with Stopwatch() as sw:
+                detector.detect_batch(self.plate_model, [dummy_crop], model_cfg.plate_conf_threshold,
+                                      model_cfg.vehicle_iou_threshold, model_cfg.plate_imgsz)
+            log.info("[pipeline] plate model self-test OK (%.0f ms on a blank 400x300 crop)", sw.ms)
+        except Exception as error:
+            log.error("[pipeline] PLATE MODEL SELF-TEST FAILED - every vehicle will be stored as 'no plate': %s",
+                      error, exc_info=True)
 
     # ------------------------------------------------------------------ #
     # Stage 1: Vehicle Detect (+ tracking)
     # ------------------------------------------------------------------ #
+    def _get_detect_region(self, frame_shape: tuple) -> Optional[Tuple[int, int, int, int]]:
+        """(x1, y1, x2, y2) of the ROI window the vehicle model is fed, or None for
+        "the whole frame". Everything outside the ROI is thrown away by the ROI
+        filter anyway, so it is never sent through the model."""
+        features = self.config.features
+        if not (features.roi_crop_detect and features.roi_filter):
+            return None
+        shape = tuple(frame_shape[:2])
+        if shape != self._detect_region_shape:
+            roi = self.config.roi
+            self._detect_region = compute_detect_region(
+                shape, roi.x_min, roi.x_max, roi.y_min, roi.y_max,
+                roi.crop_margin, detector.imgsz_hw(self.config.model.vehicle_imgsz),
+            )
+            self._detect_region_shape = shape
+            x1, y1, x2, y2 = self._detect_region
+            print(f"[pipeline] vehicle model window: x {x1}-{x2}, y {y1}-{y2} "
+                  f"({x2 - x1}x{y2 - y1} of the {shape[1]}x{shape[0]} frame)")
+        return self._detect_region
+
     def _detect_and_track_vehicles(self, frame: np.ndarray) -> List[Dict[str, Any]]:
         model_cfg, tracking_cfg, features = self.config.model, self.config.tracking, self.config.features
+        region = self._get_detect_region(frame.shape)
 
         with Stopwatch() as sw:
             vehicle_predictions = detector.track(
                 self.vehicle_model, frame,
                 model_cfg.vehicle_conf_threshold, model_cfg.vehicle_iou_threshold,
                 model_cfg.vehicle_imgsz, tracking_cfg.bytetrack_config, self.vehicle_classes,
+                region=region,
             )
         self._last_vehicle_detect_ms = sw.ms if features.time_vehicle_detect else None
 
@@ -179,27 +263,38 @@ class DetectionPipeline:
     # ------------------------------------------------------------------ #
     # Stage 2/3: Vehicle Crop
     # ------------------------------------------------------------------ #
-    def _get_or_create_vehicle_crop(self, frame: np.ndarray, prediction: Dict[str, Any]) -> Optional[str]:
-        """Returns the track_id that should be used for this detection
-        (which may be remapped by the position-deduper) and ensures a crop
-        exists in memory for it. Returns None if cropping failed."""
+    def _register_vehicle(self, frame: np.ndarray, prediction: Dict[str, Any], now: float) -> Tuple[Optional[str], bool]:
+        """Returns (track_id, created).
+
+        * id already known      -> just refresh "last seen"; NOTHING else is redone
+        * id new but it is really a vehicle we saved a moment ago (position dedup)
+                                -> remapped onto that earlier id, treated as known
+        * id genuinely new      -> crop it, start its state, `created=True`
+        (None, False) if the crop failed.
+        """
         track_id = prediction["track_id"]
         features = self.config.features
 
-        if track_id in self._saved_vehicle_crops:
-            # already have this vehicle - just refresh its dedup timestamp
-            # so a vehicle sitting still (red light) doesn't get re-triggered
+        state = self._tracks.get(track_id)
+        if state is not None:
+            state.last_seen = now
+            state.prediction = prediction
+            # refresh the dedup timestamp so a vehicle sitting still (red light)
+            # doesn't get re-triggered under a new id
             if features.position_dedup:
                 self.deduper.refresh(track_id, prediction)
-            return track_id
+            return track_id, False
 
         # is this "new" track_id actually the same physical vehicle as one we
         # already saved a moment ago in the same spot?
         if features.position_dedup:
             existing_track_id = self.deduper.find_existing_track(prediction)
-            if existing_track_id is not None:
+            if existing_track_id is not None and existing_track_id in self._tracks:
                 prediction["track_id"] = existing_track_id
-                return existing_track_id
+                state = self._tracks[existing_track_id]
+                state.last_seen = now
+                state.prediction = prediction
+                return existing_track_id, False
 
         crop_cfg = self.config.crop
         with Stopwatch() as sw:
@@ -207,7 +302,7 @@ class DetectionPipeline:
                 frame, prediction, crop_cfg.vehicle_padding_ratio, crop_cfg.vehicle_min_crop_height,
             )
         if vehicle_crop is None:
-            return None
+            return None, False
 
         # record this vehicle's timing: the detect-model call that found it
         # (shared across every vehicle in this frame) plus its own crop time
@@ -215,17 +310,13 @@ class DetectionPipeline:
             vehicle_detect_ms=self._last_vehicle_detect_ms,
             vehicle_crop_ms=sw.ms if features.time_vehicle_crop else None,
         )
-        self._timings[track_id] = timing
-
-        self._saved_vehicle_crops[track_id] = vehicle_crop
+        self._tracks[track_id] = _TrackState(
+            timing=timing, crop=vehicle_crop, prediction=prediction, last_seen=now,
+            stem=f"{self._session_tag}_{track_id}",
+        )
         if features.position_dedup:
             self.deduper.remember_save(track_id, prediction)
-        self._plate_attempts[track_id] = 0
-
-        if features.save_images_to_disk:
-            self._write_crop_to_disk("vehicle_detection", f"{track_id}_{self._safe_name(prediction.get('class'))}", vehicle_crop)
-
-        return track_id
+        return track_id, True
 
     # ------------------------------------------------------------------ #
     # Stage 4/5: Plate Detect + Crop
@@ -237,38 +328,43 @@ class DetectionPipeline:
             self._last_plate_detect_ms = None
             return {}
 
-        crops = [self._saved_vehicle_crops[track_id] for track_id in track_ids_needing_plate]
-        if features.enhance_before_plate_detect:
-            crops = [image_ops.sharpen_and_denoise(crop) for crop in crops]
-
         model_cfg = self.config.model
         try:
+            crops = [self._tracks[track_id].crop for track_id in track_ids_needing_plate]
+            if features.enhance_before_plate_detect:
+                crops = [image_ops.sharpen_and_denoise(crop) for crop in crops]
             with Stopwatch() as sw:
                 batch_results = detector.detect_batch(
                     self.plate_model, crops,
                     model_cfg.plate_conf_threshold, model_cfg.vehicle_iou_threshold, model_cfg.plate_imgsz,
                 )
             self._last_plate_detect_ms = sw.ms if features.time_plate_detect else None
-        except detector.InferenceError as error:
-            if features.print_console:
-                print(f"[pipeline] plate detection error: {error}")
+        except Exception as error:
+            # A model/preprocessing FAILURE is not the same as "no plate in the picture", but the
+            # vehicle still gets stored as no-plate - so say so loudly (always, not only when
+            # print_console is on) and leave plate_detect_ms NULL, which is the tell-tale in the DB.
+            log.warning("plate stage FAILED for %s - stored WITHOUT a plate: %s",
+                        track_ids_needing_plate, error, exc_info=True)
             batch_results = [[] for _ in track_ids_needing_plate]
             self._last_plate_detect_ms = None
 
         # every track in this batch shares the same plate-detect timing
         for track_id in track_ids_needing_plate:
-            if track_id in self._timings:
-                self._timings[track_id].plate_detect_ms = self._last_plate_detect_ms
+            self._tracks[track_id].timing.plate_detect_ms = self._last_plate_detect_ms
 
         return dict(zip(track_ids_needing_plate, batch_results))
 
-    def _finalize_vehicle(self, track_id: str, base_prediction: Dict[str, Any], plate_predictions: List[Dict[str, Any]]) -> None:
+    def _finalize_vehicle(self, track_id: str, state: _TrackState, plate_predictions: List[Dict[str, Any]]) -> None:
         """Pick the best plate (if any), crop + enhance it, and hand the
         completed record off to storage. Marks the track as finalized so it
-        is never processed again."""
+        is never processed again, and frees its crop."""
         crop_cfg, preprocess_cfg, features = self.config.crop, self.config.preprocess, self.config.features
-        vehicle_crop = self._saved_vehicle_crops[track_id]
-        timing = self._timings[track_id]
+        vehicle_crop = state.crop
+        timing = state.timing
+        base_prediction = state.prediction
+        # spot-check copies: the already-encoded JPEG bytes are handed to the storage
+        # writer thread, so no imwrite / second encode happens on the detection loop
+        disk_files: Optional[Dict[str, bytes]] = {} if features.save_images_to_disk else None
 
         plate_confidence: Optional[float] = None
         plate_image_bytes: Optional[bytes] = None
@@ -302,8 +398,8 @@ class DetectionPipeline:
                 plate_confidence = float(best_plate.get("confidence", 0.0))
                 plate_image_bytes = image_ops.encode_jpeg(plate_crop, self.config.storage.jpeg_quality)
                 plate_detected = True
-                if features.save_images_to_disk:
-                    self._write_crop_to_disk("plate_detection", f"{track_id}_plate", plate_crop)
+                if disk_files is not None:
+                    disk_files[f"plate_detection/{state.stem}_plate.jpg"] = plate_image_bytes
 
                 # a plate crop exists - attempt an OCR read on it. Any failure
                 # (OCR disabled, engine unavailable, low confidence, no text
@@ -333,12 +429,18 @@ class DetectionPipeline:
         # needed to draw this vehicle's box back onto the full camera frame
         vehicle_x1, vehicle_y1, vehicle_x2, vehicle_y2 = box_edges(base_prediction)
 
+        vehicle_jpeg = None
+        if features.col_vehicle_image or disk_files is not None:
+            vehicle_jpeg = image_ops.encode_jpeg(vehicle_crop, self.config.storage.jpeg_quality)
+            if disk_files is not None:
+                disk_files[f"vehicle_detection/{state.stem}_{self._safe_name(base_prediction.get('class'))}.jpg"] = vehicle_jpeg
+
         record = DetectionRecord(
             track_id=track_id,
             camera_source=self.camera_source,
             vehicle_class=str(base_prediction.get("class") or "vehicle"),
             vehicle_confidence=float(base_prediction.get("confidence", 0.0)),
-            vehicle_image_jpeg=image_ops.encode_jpeg(vehicle_crop, self.config.storage.jpeg_quality) if features.col_vehicle_image else None,
+            vehicle_image_jpeg=vehicle_jpeg if features.col_vehicle_image else None,
             vehicle_box_x1=vehicle_x1 if features.col_vehicle_box else None,
             vehicle_box_y1=vehicle_y1 if features.col_vehicle_box else None,
             vehicle_box_x2=vehicle_x2 if features.col_vehicle_box else None,
@@ -358,11 +460,15 @@ class DetectionPipeline:
             total_pipeline_ms=timing.total_ms if features.col_total_pipeline_ms else None,
             ocr_process=ocr_process if features.col_ocr_read else False,
             ocr_read=ocr_read if features.col_ocr_read else self.config.ocr.unrecognized_text,
+            disk_files=disk_files,
         )
 
         if features.store_to_sqlite:
             self.storage.enqueue(record)
-        self._finalized_tracks.add(track_id)
+        # done with this vehicle: keep the tiny state entry (so the same id is skipped
+        # while it stays in view) but release the crop pixels right away
+        state.finalized = True
+        state.crop = None
 
         if features.print_console:
             if plate_detected:
@@ -395,13 +501,18 @@ class DetectionPipeline:
         """Runs the full Vehicle Detect -> Crop -> Plate Detect -> Crop flow
         for one frame. Returns how many NEW vehicles were cropped this call.
 
+        Per tracking ID the rule is simple: a NEW id gets processed (crop, one
+        plate pass, store); the SAME id showing up again in later frames is
+        skipped, apart from refreshing its "last seen" time.
+
         `always_finalize=True` is used for single-image/folder mode: there is
         no "next frame" to try again on, so the vehicle must be finalized
-        (plate found or not) after this one and only attempt, regardless of
-        `tracking.max_plate_attempts` (which exists for the live-stream case,
-        where the same vehicle is seen across many frames).
+        (plate found or not) after this one and only attempt.
         """
         frame_shape = frame.shape[:2]
+        features = self.config.features
+        max_attempts = max(1, self.config.tracking.max_plate_attempts)
+        now = time.monotonic()
 
         # Stage 1: detect + track every vehicle in the frame
         vehicle_predictions = self._detect_and_track_vehicles(frame)
@@ -414,24 +525,28 @@ class DetectionPipeline:
 
         new_vehicle_count = 0
         track_ids_needing_plate: List[str] = []
-        base_prediction_by_track: Dict[str, Dict[str, Any]] = {}
 
-        # Stage 2/3: make sure every currently-visible vehicle has a crop
+        # Stage 2/3: crop every NEW vehicle; known ids are only refreshed
         for prediction in vehicle_predictions:
-            was_new = prediction["track_id"] not in self._saved_vehicle_crops
-            track_id = self._get_or_create_vehicle_crop(frame, prediction)
+            if not prediction.get("track_id"):
+                continue
+            track_id, created = self._register_vehicle(frame, prediction, now)
             if track_id is None:
                 continue
-            if was_new and track_id not in self._finalized_tracks:
+            state = self._tracks[track_id]
+            if created:
                 new_vehicle_count += 1
 
-            base_prediction_by_track[track_id] = prediction
+            if state.finalized or state.attempts >= max_attempts:
+                continue                    # same id as one already handled -> skip the rest
 
-            attempts = self._plate_attempts.get(track_id, 0)
-            already_done = track_id in self._finalized_tracks
-            attempts_exhausted = attempts >= self.config.tracking.max_plate_attempts
-            if not already_done and not attempts_exhausted:
-                track_ids_needing_plate.append(track_id)
+            if state.attempts > 0:
+                # a retry (max_plate_attempts > 1): look at the vehicle NOW, not the stale first crop
+                crop_cfg = self.config.crop
+                fresh_crop = crop_vehicle(frame, prediction, crop_cfg.vehicle_padding_ratio, crop_cfg.vehicle_min_crop_height)
+                if fresh_crop is not None:
+                    state.crop = fresh_crop
+            track_ids_needing_plate.append(track_id)
 
         # Live feed: publish NOW, before the (slower) plate model runs, so
         # boxes go out at detector speed. By this point the dedup step has
@@ -441,19 +556,44 @@ class DetectionPipeline:
             if live_sink is not None:
                 live_sink.publish(frame_shape, all_tracked_vehicles, in_roi_ids, captured_at)
 
-        # Stage 4: run the plate model, once, on every vehicle crop that needs it
-        plate_results = self._run_plate_detection(track_ids_needing_plate)
+        if not features.plate_detection:
+            # vehicles-only mode: nothing more to wait for, store them right away
+            for track_id in track_ids_needing_plate:
+                self._finalize_vehicle(track_id, self._tracks[track_id], [])
+        else:
+            # Stage 4: run the plate model, once, on every vehicle crop that needs it
+            plate_results = self._run_plate_detection(track_ids_needing_plate)
 
-        # Stage 5/6: crop + save the plate (or record the attempt) for each vehicle
-        for track_id, plate_predictions in plate_results.items():
-            self._plate_attempts[track_id] = self._plate_attempts.get(track_id, 0) + 1
-            attempts = self._plate_attempts[track_id]
-            attempts_exhausted = always_finalize or attempts >= self.config.tracking.max_plate_attempts
+            # Stage 5/6: crop + save the plate (or record the attempt) for each vehicle
+            for track_id, plate_predictions in plate_results.items():
+                state = self._tracks[track_id]
+                state.attempts += 1
+                attempts_exhausted = always_finalize or state.attempts >= max_attempts
+                if plate_predictions or attempts_exhausted:
+                    self._finalize_vehicle(track_id, state, plate_predictions)
 
-            if plate_predictions or attempts_exhausted:
-                self._finalize_vehicle(track_id, base_prediction_by_track[track_id], plate_predictions)
+        if now - self._last_prune >= _PRUNE_INTERVAL_SECONDS:
+            self._prune_tracks(now)
 
         return new_vehicle_count
+
+    def _prune_tracks(self, now: float) -> None:
+        """Forget tracks that have not been seen for `track_ttl_seconds`, so memory stays
+        flat however long the Pi runs. A vehicle that disappeared before it was finalized
+        (it left the ROI before its plate pass finished) is stored as it stands, instead
+        of being silently lost."""
+        self._last_prune = now
+        ttl = self.config.tracking.track_ttl_seconds
+        expired = [track_id for track_id, state in self._tracks.items() if now - state.last_seen > ttl]
+        for track_id in expired:
+            state = self._tracks[track_id]
+            if not state.finalized and state.crop is not None:
+                try:
+                    self._finalize_vehicle(track_id, state, [])
+                except Exception as error:      # housekeeping must never take the detection loop down
+                    log.warning("could not store expired track %s: %s", track_id, error)
+            del self._tracks[track_id]
+        self.deduper.prune()
 
     # ------------------------------------------------------------------ #
     # small helpers
@@ -475,9 +615,3 @@ class DetectionPipeline:
         """Turn a class name into something safe to use inside a filename."""
         value = value or "vehicle"
         return "".join(ch if ch.isalnum() else "_" for ch in value)
-
-    def _write_crop_to_disk(self, subfolder: str, stem: str, image: np.ndarray) -> None:
-        """Optional convenience copy of a crop on disk, alongside the DB blob."""
-        directory = os.path.join(self.config.storage.output_dir, subfolder)
-        path = os.path.join(directory, f"{stem}.jpg")
-        cv2.imwrite(path, image, [cv2.IMWRITE_JPEG_QUALITY, self.config.storage.jpeg_quality])
