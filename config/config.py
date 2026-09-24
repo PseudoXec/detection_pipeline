@@ -268,7 +268,8 @@ class LiveConfig:
     stream_width: int = 960                 # downscale to this width before encoding; 0 = full size
     jpeg_quality: int = 70                  # 1-100; lower = less bandwidth and CPU
     box_max_age_seconds: float = 3.0        # boxes older than this are not drawn (detector stalled)
-    box_extrapolate: bool = True            # slide boxes along each vehicle's measured speed between detections
+    box_visual_tracking: bool = True        # follow the picture inside each box between detections (smooth from the first sighting)
+    box_extrapolate: bool = True            # fallback: slide boxes along each vehicle's measured speed between detections
     box_extrapolate_max_seconds: float = 3.5  # never project further ahead than this (inference delay + gap to next detection)
     auth_token: Optional[str] = None        # if set, viewers must send it (?token= or Bearer header)
 

@@ -29,6 +29,7 @@ Design rules (same spirit as box_publisher.py - this must never hurt detection):
 import hmac
 import json
 import logging
+import math
 import threading
 import time
 import uuid
@@ -37,7 +38,9 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 from urllib.parse import parse_qs, urlparse
 
 import cv2
+import numpy as np
 
+from live.box_flow import BoxFlow
 from live.snapshot import build_snapshot
 
 log = logging.getLogger("pipeline")
@@ -46,6 +49,7 @@ _BOUNDARY = "frame"
 _GREEN = (0, 200, 0)       # every box is green (in_roi is still reported by /live/boxes)
 _LINE_THICKNESS = 1        # box outline, in pixels of the streamed image
 _FONT_SCALE = 0.4          # label text size
+_BLEND_SECONDS = 0.4       # when a fresh detection corrects a box, glide to the new position over about this long
 
 
 class LiveServer:
@@ -61,6 +65,7 @@ class LiveServer:
         auth_token: Optional[str] = None,
         box_extrapolate: bool = True,
         box_extrapolate_max_seconds: float = 3.5,
+        box_visual_tracking: bool = True,
     ):
         self.camera_id = camera_id
         self.host = host
@@ -76,6 +81,11 @@ class LiveServer:
         # with the picture between detections instead of jumping once per update.
         self.box_extrapolate = box_extrapolate
         self.box_extrapolate_max_seconds = box_extrapolate_max_seconds
+        # Follows the picture inside each box (optical flow) so a vehicle's box moves
+        # from its FIRST detection - guessing speed from detections needs two of them.
+        # The extrapolation above stays as the fallback when the picture can't be followed.
+        self._flow: Optional[BoxFlow] = BoxFlow() if box_visual_tracking else None
+        self._shown: Dict[Any, Dict[str, Any]] = {}      # track_id -> what we last drew (for blending)
         self.session_id = uuid.uuid4().hex[:8]
 
         self._frame_source: Optional[Callable[[], Any]] = None   # -> CapturedFrame | None
@@ -211,6 +221,14 @@ class LiveServer:
             if cached and cached[0] == key:
                 return cached
 
+            if overlay and self._flow is not None:
+                # remember every frame (small, grayscale) so a new detection can be
+                # replayed forward to "now" - see live/box_flow.py
+                try:
+                    self._flow.add_frame(captured.image, captured.captured_at, captured.frame_number)
+                except Exception as error:
+                    self._disable_flow(error)
+
             image = captured.image
             src_h, src_w = image.shape[:2]
             if self.stream_width and src_w > self.stream_width:
@@ -220,7 +238,14 @@ class LiveServer:
             elif overlay and snap:
                 image = image.copy()          # never draw on the camera thread's array
             if snap:
-                self._draw(image, snap, self._project_boxes(snap, captured.captured_at))
+                try:
+                    vehicles = self._boxes_for_frame(snap, captured)
+                except Exception as error:
+                    self._disable_flow(error)    # box smoothing is a nicety: it must never break the video
+                    vehicles = snap["vehicles"]
+                self._draw(image, snap, vehicles)
+            else:
+                self._shown.clear()              # detector stalled: forget old boxes so they can't glide back in
 
             ok, buf = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality])
             if not ok:
@@ -228,6 +253,61 @@ class LiveServer:
             result = (key, buf.tobytes())
             self._cache[overlay] = result
             return result
+
+    def _disable_flow(self, error: Exception) -> None:
+        if self._flow is not None:
+            log.warning("[live] box tracking turned off after an error (%s) - boxes fall back to plain detections", error)
+        self._flow = None
+        self._shown.clear()
+
+    def _boxes_for_frame(self, snap: Dict[str, Any], captured: Any) -> List[Dict[str, Any]]:
+        """Where to draw each vehicle on THIS frame (detector pixels).
+        Best source first: the box followed through the video itself; else the box
+        moved along the speed measured from earlier detections; else where it was detected."""
+        now = captured.captured_at
+        if self._flow is not None:
+            self._flow.sync(snap)
+        estimates = self._project_boxes(snap, now)
+
+        drawn: List[Dict[str, Any]] = []
+        alive = set()
+        for vehicle in estimates:
+            track_id = vehicle.get("track_id")
+            if track_id is None:
+                drawn.append(vehicle)
+                continue
+            followed = self._flow.box(track_id) if self._flow is not None else None
+            if followed is not None:
+                source, target = "flow", followed
+            else:
+                source = "estimate"
+                target = np.array([vehicle["x1"], vehicle["y1"], vehicle["x2"], vehicle["y2"]], dtype=np.float64)
+            alive.add(track_id)
+            x1, y1, x2, y2 = self._blend(track_id, snap["seq"], source, target, now)
+            drawn.append(dict(vehicle, x1=float(x1), y1=float(y1), x2=float(x2), y2=float(y2)))
+
+        for gone in [t for t in self._shown if t not in alive]:
+            del self._shown[gone]
+        return drawn
+
+    def _blend(self, track_id: Any, seq: int, source: str, target: np.ndarray, now: float) -> np.ndarray:
+        """Stops a corrected box from jumping. Whenever the estimate changes (a new
+        detection arrived, or we switched between following/estimating), the box
+        carries on from where it was heading and glides onto the new estimate,
+        instead of teleporting there."""
+        state = self._shown.get(track_id)
+        if state is None:
+            offset, since, step = np.zeros(4), now, np.zeros(4)
+        elif state["seq"] == seq and state["source"] == source:
+            offset, since, step = state["offset"], state["since"], target - state["target"]
+        else:
+            step = state["step"]
+            offset = (state["shown"] + step) - target      # where the box would be now if nothing had changed
+            since = now
+        shown = target + offset * math.exp(-max(0.0, now - since) / _BLEND_SECONDS)
+        self._shown[track_id] = {"seq": seq, "source": source, "target": target, "shown": shown,
+                                 "step": step, "offset": offset, "since": since}
+        return shown
 
     @staticmethod
     def _draw(image, snap: Dict[str, Any], vehicles: Optional[List[Dict[str, Any]]] = None) -> None:

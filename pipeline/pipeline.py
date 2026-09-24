@@ -110,6 +110,7 @@ class DetectionPipeline:
                 jpeg_quality=config.live.jpeg_quality,
                 box_max_age_seconds=config.live.box_max_age_seconds,
                 auth_token=config.live.auth_token,
+                box_visual_tracking=config.live.box_visual_tracking,
                 box_extrapolate=config.live.box_extrapolate,
                 box_extrapolate_max_seconds=config.live.box_extrapolate_max_seconds,
             )
