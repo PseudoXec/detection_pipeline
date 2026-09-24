@@ -163,6 +163,15 @@ class TrackingConfig:
     # ever give the same answer).
     max_plate_attempts: int = 1
 
+    # with max_plate_attempts > 1 the pipeline keeps the BEST plate seen so far (highest
+    # OCR score, then plate confidence) and only stops early once a read is good enough
+    # (ocr.accept_score). Retries are spaced this far apart so each one looks at a
+    # genuinely different frame - at 10 fps, consecutive frames are near-identical.
+    plate_retry_interval_seconds: float = 0.4
+    # a vehicle still waiting for a good plate is stored as it stands (best so far) once
+    # it has been out of the ROI this long, so the dashboard never waits on track_ttl_seconds
+    plate_stale_finalize_seconds: float = 1.5
+
     # forget a track (and free its crop) once it hasn't been seen for this long.
     # A vehicle that vanishes before a plate was found is stored as "no plate".
     track_ttl_seconds: float = 30.0
@@ -175,8 +184,9 @@ class CropConfig:
     vehicle_padding_ratio: float = 0.08      # extra margin around a vehicle box
     vehicle_min_crop_height: int = 200       # upscale small vehicle crops to at least this
 
-    plate_padding_pixels: int = 4            # extra margin around a plate box
-    plate_min_crop_height: int = 120
+    plate_padding_pixels: int = 4            # extra margin around a plate box (minimum)
+    plate_padding_ratio: float = 0.12        # ...or this fraction of the plate box height, whichever is larger
+    plate_min_crop_height: int = 160         # upscale small plate crops to at least this tall
 
     # plate containment / IoU used to decide "which vehicle does this plate belong to"
     plate_containment_threshold: float = 0.8
@@ -210,6 +220,11 @@ class OcrConfig:
     # text used whenever a plate crop exists but OCR could not read it
     # (crop too blurry/dark, recognizer errored, confidence too low, etc.)
     unrecognized_text: str = "Unrecognized"
+    # an OCR quality score (0..1, see PlateOCRReader.read_scored) at or above this
+    # ends the plate retries for a vehicle; below it, the next attempt may do better
+    accept_score: float = 0.75
+    # once one image variant scores this high, the other variants are not tried (saves CPU)
+    early_exit_score: float = 0.85
 
 
 @dataclass
@@ -228,6 +243,9 @@ class StorageConfig:
 
     # JPEG quality used both for the DB blob and the on-disk copy
     jpeg_quality: int = 90
+    # the plate crop is small, so its JPEG costs little - store it near-lossless
+    # (this is the image the C# side receives, and any re-OCR there starts from it)
+    plate_jpeg_quality: int = 96
 
     # background writer batches this many rows per SQLite transaction
     write_batch_size: int = 8

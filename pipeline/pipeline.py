@@ -45,6 +45,25 @@ _PRUNE_INTERVAL_SECONDS = 5.0
 
 
 @dataclass
+class _PlateCandidate:
+    """One plate sighting: the crop, where it was, and how well OCR could read it. A vehicle
+    keeps only its best candidate across attempts, and that one is what gets stored."""
+
+    vehicle_crop: np.ndarray            # the vehicle crop THIS plate was detected on (box coords are relative to it)
+    box: Tuple[float, float, float, float]   # plate box edges (left, top, right, bottom) in vehicle_crop pixels
+    plate_crop: np.ndarray              # enhanced plate crop (what is stored / sent)
+    plate_conf: float                   # plate detector confidence
+    crop_ms: Optional[float]            # time spent cutting + enhancing this crop
+    ocr_text: Optional[str] = None      # cleaned plate text, None if unreadable
+    ocr_score: float = 0.0              # 0..1 OCR quality (see PlateOCRReader.read_scored)
+
+    @property
+    def rank(self) -> Tuple[float, float]:
+        """Higher is better: a readable plate beats an unreadable one, then plate confidence decides."""
+        return (self.ocr_score, self.plate_conf)
+
+
+@dataclass
 class _TrackState:
     """Everything remembered about ONE tracking ID. Replaces four separate dicts
     (crops / timings / attempts / finalized) that were never pruned - together they
@@ -57,6 +76,8 @@ class _TrackState:
     stem: str                           # unique file-name stem for the on-disk copies
     attempts: int = 0                   # plate passes done so far
     finalized: bool = False             # True = stored; every later frame with this id is skipped
+    last_attempt: float = 0.0           # time.monotonic() of the latest plate pass (spaces out retries)
+    best: Optional["_PlateCandidate"] = None   # best plate seen so far across this vehicle's attempts
 
 
 class DetectionPipeline:
@@ -103,6 +124,7 @@ class DetectionPipeline:
                 lang=config.ocr.lang,
                 min_confidence=config.ocr.min_confidence,
                 allowed_chars=config.ocr.allowed_chars,
+                early_exit_score=config.ocr.early_exit_score,
             )
             if config.features.ocr_read
             else None
@@ -354,12 +376,86 @@ class DetectionPipeline:
 
         return dict(zip(track_ids_needing_plate, batch_results))
 
-    def _finalize_vehicle(self, track_id: str, state: _TrackState, plate_predictions: List[Dict[str, Any]]) -> None:
-        """Pick the best plate (if any), crop + enhance it, and hand the
-        completed record off to storage. Marks the track as finalized so it
-        is never processed again, and frees its crop."""
+    def _evaluate_plate(self, state: _TrackState, plate_predictions: List[Dict[str, Any]]) -> Optional[_PlateCandidate]:
+        """Cut the best plate box out of this attempt's vehicle crop, enhance it and try to read it.
+        Returns None if the crop could not be produced (degenerate box)."""
         crop_cfg, preprocess_cfg, features = self.config.crop, self.config.preprocess, self.config.features
         vehicle_crop = state.crop
+        if vehicle_crop is None:
+            return None
+
+        best_plate = max(plate_predictions, key=lambda p: p.get("confidence", 0.0))
+        # raw detection box edges, in the vehicle crop's own pixel space -
+        # exactly what's needed to draw a rectangle on the stored vehicle_image
+        box = box_edges(best_plate)
+
+        with Stopwatch() as sw:
+            raw_crop = crop_plate(
+                vehicle_crop, best_plate, crop_cfg.plate_padding_pixels, crop_cfg.plate_min_crop_height,
+                crop_cfg.plate_padding_ratio,
+            )
+            plate_crop = raw_crop
+            if raw_crop is not None and features.enhance_plate_crop:
+                plate_crop = image_ops.enhance_plate_crop(raw_crop, preprocess_cfg.plate_crop_min_height)
+        if raw_crop is None:
+            return None
+
+        candidate = _PlateCandidate(
+            vehicle_crop=vehicle_crop, box=box, plate_crop=plate_crop,
+            plate_conf=float(best_plate.get("confidence", 0.0)),
+            crop_ms=sw.ms if features.time_plate_crop else None,
+        )
+
+        # OCR the enhanced crop AND the plain one: enhancement helps some plates and
+        # hurts others, and the better read wins. Any failure (OCR disabled, engine
+        # unavailable, low confidence, no text found) just leaves ocr_text None - it
+        # never blocks or crashes the pipeline.
+        if self.ocr_reader is not None:
+            try:
+                alternate = raw_crop if raw_crop is not plate_crop else None
+                candidate.ocr_text, candidate.ocr_score = self.ocr_reader.read_scored(plate_crop, alternate)
+            except Exception as error:
+                if features.print_console:
+                    print(f"[pipeline] OCR read failed: {error}")
+        return candidate
+
+    def _is_good_enough(self, candidate: Optional[_PlateCandidate]) -> bool:
+        """True when there's no point trying another frame for this vehicle."""
+        if candidate is None:
+            return False
+        if self.ocr_reader is None or getattr(self.ocr_reader, "_load_failed", False):
+            # no working OCR to judge readability, so fall back to the detector's own confidence
+            # (otherwise every vehicle would burn all its retries on a reader that can't read)
+            return candidate.plate_conf >= self.config.model.plate_conf_threshold
+        return bool(candidate.ocr_text) and candidate.ocr_score >= self.config.ocr.accept_score
+
+    def _flush_stale_pending(self, now: float) -> None:
+        """A vehicle that is still waiting for a better plate but has left the ROI will not
+        get another attempt: store its best sighting now rather than after track_ttl_seconds."""
+        wait = self.config.tracking.plate_stale_finalize_seconds
+        if wait <= 0:
+            return
+        for track_id, state in list(self._tracks.items()):
+            if state.finalized or state.attempts == 0 or state.crop is None:
+                continue
+            if now - state.last_seen > wait:
+                try:
+                    self._finalize_vehicle(track_id, state)
+                except Exception as error:      # must never take the detection loop down
+                    log.warning("could not store stale track %s: %s", track_id, error)
+
+    def _finalize_vehicle(self, track_id: str, state: _TrackState) -> None:
+        """Store the vehicle with the best plate sighting collected for it (if any) and hand
+        the completed record to storage. Marks the track as finalized so it is never
+        processed again, and frees its crops."""
+        features = self.config.features
+        best = state.best
+        # the plate box is relative to the crop the plate was found on, so the stored
+        # vehicle image must be that same crop (it is not always the latest one)
+        vehicle_crop = best.vehicle_crop if best is not None else state.crop
+        if vehicle_crop is None:            # nothing left to store (crop already released)
+            state.finalized = True
+            return
         timing = state.timing
         base_prediction = state.prediction
         # spot-check copies: the already-encoded JPEG bytes are handed to the storage
@@ -369,61 +465,28 @@ class DetectionPipeline:
         plate_confidence: Optional[float] = None
         plate_image_bytes: Optional[bytes] = None
         plate_detected = False
-        # plate box edges are relative to the VEHICLE CROP (same pixel space
-        # as vehicle_image_jpeg) since that's what the plate model actually
-        # saw; None until/unless a plate is actually found below
         plate_x1: Optional[float] = None
         plate_y1: Optional[float] = None
         plate_x2: Optional[float] = None
         plate_y2: Optional[float] = None
 
-        # OCR metadata - defaults cover "no plate ever found for this
-        # vehicle" (attempts_exhausted with no plate_predictions at all):
+        # OCR metadata - defaults cover "no plate ever found for this vehicle":
         # no OCR pass was possible, so the read is unrecognized by definition
         ocr_process = False
         ocr_read = self.config.ocr.unrecognized_text
 
-        if plate_predictions:
-            best_plate = max(plate_predictions, key=lambda p: p.get("confidence", 0.0))
-            # raw detection box edges, in the vehicle crop's own pixel space -
-            # exactly what's needed to draw a rectangle on the stored vehicle_image
-            plate_x1, plate_y1, plate_x2, plate_y2 = box_edges(best_plate)
-            with Stopwatch() as sw:
-                plate_crop = crop_plate(vehicle_crop, best_plate, crop_cfg.plate_padding_pixels, crop_cfg.plate_min_crop_height)
-                if plate_crop is not None and features.enhance_plate_crop:
-                    plate_crop = image_ops.enhance_plate_crop(plate_crop, preprocess_cfg.plate_crop_min_height)
-            timing.plate_crop_ms = sw.ms if features.time_plate_crop else None
-
-            if plate_crop is not None:
-                plate_confidence = float(best_plate.get("confidence", 0.0))
-                plate_image_bytes = image_ops.encode_jpeg(plate_crop, self.config.storage.jpeg_quality)
-                plate_detected = True
-                if disk_files is not None:
-                    disk_files[f"plate_detection/{state.stem}_plate.jpg"] = plate_image_bytes
-
-                # a plate crop exists - attempt an OCR read on it. Any failure
-                # (OCR disabled, engine unavailable, low confidence, no text
-                # found) falls back to the configured "Unrecognized" text,
-                # it never blocks or crashes the finalize step.
-                ocr_process = True
-                ocr_text = None
-                if self.ocr_reader is not None:
-                    try:
-                        ocr_text = self.ocr_reader.read(plate_crop)
-                    except Exception as error:
-                        if features.print_console:
-                            print(f"[pipeline] {track_id} OCR read failed: {error}")
-                        ocr_text = None
-                ocr_read = ocr_text if ocr_text else self.config.ocr.unrecognized_text
-            else:
-                # detection fired but the crop itself failed (degenerate box) -
-                # don't report box coordinates for a plate we didn't actually save
-                plate_x1 = plate_y1 = plate_x2 = plate_y2 = None
-                # a plate box existed but we couldn't produce a crop to OCR -
-                # still "attempted" in the sense that a plate was detected,
-                # but there was nothing to read
-                ocr_process = True
-                ocr_read = self.config.ocr.unrecognized_text
+        if best is not None:
+            plate_x1, plate_y1, plate_x2, plate_y2 = best.box
+            timing.plate_crop_ms = best.crop_ms
+            plate_confidence = best.plate_conf
+            plate_image_bytes = image_ops.encode_jpeg(best.plate_crop, self.config.storage.plate_jpeg_quality)
+            plate_detected = True
+            if disk_files is not None:
+                disk_files[f"plate_detection/{state.stem}_plate.jpg"] = plate_image_bytes
+            # a plate crop exists, so an OCR read was attempted on it; an unreadable
+            # one falls back to the configured "Unrecognized" text
+            ocr_process = True
+            ocr_read = best.ocr_text if best.ocr_text else self.config.ocr.unrecognized_text
 
         # vehicle box edges, in the ORIGINAL FULL FRAME's pixel space - what's
         # needed to draw this vehicle's box back onto the full camera frame
@@ -469,6 +532,7 @@ class DetectionPipeline:
         # while it stays in view) but release the crop pixels right away
         state.finalized = True
         state.crop = None
+        state.best = None
 
         if features.print_console:
             if plate_detected:
@@ -541,11 +605,15 @@ class DetectionPipeline:
                 continue                    # same id as one already handled -> skip the rest
 
             if state.attempts > 0:
+                # space retries out: consecutive frames are near-identical, a later one is not
+                if now - state.last_attempt < self.config.tracking.plate_retry_interval_seconds:
+                    continue
                 # a retry (max_plate_attempts > 1): look at the vehicle NOW, not the stale first crop
                 crop_cfg = self.config.crop
                 fresh_crop = crop_vehicle(frame, prediction, crop_cfg.vehicle_padding_ratio, crop_cfg.vehicle_min_crop_height)
                 if fresh_crop is not None:
                     state.crop = fresh_crop
+            state.last_attempt = now
             track_ids_needing_plate.append(track_id)
 
         # Live feed: publish NOW, before the (slower) plate model runs, so
@@ -559,7 +627,7 @@ class DetectionPipeline:
         if not features.plate_detection:
             # vehicles-only mode: nothing more to wait for, store them right away
             for track_id in track_ids_needing_plate:
-                self._finalize_vehicle(track_id, self._tracks[track_id], [])
+                self._finalize_vehicle(track_id, self._tracks[track_id])
         else:
             # Stage 4: run the plate model, once, on every vehicle crop that needs it
             plate_results = self._run_plate_detection(track_ids_needing_plate)
@@ -569,8 +637,17 @@ class DetectionPipeline:
                 state = self._tracks[track_id]
                 state.attempts += 1
                 attempts_exhausted = always_finalize or state.attempts >= max_attempts
-                if plate_predictions or attempts_exhausted:
-                    self._finalize_vehicle(track_id, state, plate_predictions)
+
+                # cut + enhance + OCR this sighting, keep it only if it beats what we have
+                if plate_predictions:
+                    candidate = self._evaluate_plate(state, plate_predictions)
+                    if candidate is not None and (state.best is None or candidate.rank > state.best.rank):
+                        state.best = candidate
+
+                if self._is_good_enough(state.best) or attempts_exhausted:
+                    self._finalize_vehicle(track_id, state)
+
+            self._flush_stale_pending(now)
 
         if now - self._last_prune >= _PRUNE_INTERVAL_SECONDS:
             self._prune_tracks(now)
@@ -589,7 +666,7 @@ class DetectionPipeline:
             state = self._tracks[track_id]
             if not state.finalized and state.crop is not None:
                 try:
-                    self._finalize_vehicle(track_id, state, [])
+                    self._finalize_vehicle(track_id, state)
                 except Exception as error:      # housekeeping must never take the detection loop down
                     log.warning("could not store expired track %s: %s", track_id, error)
             del self._tracks[track_id]

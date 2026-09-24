@@ -141,6 +141,7 @@ def crop_plate(
     plate_box: Dict[str, Any],
     padding_pixels: int = 8,
     min_crop_height: int = 0,
+    padding_ratio: float = 0.0,
 ) -> Optional[np.ndarray]:
     """Cut a plate out of a vehicle crop (plate boxes come from the plate
     model, which runs *on* the vehicle crop, not the full frame)."""
@@ -149,12 +150,17 @@ def crop_plate(
     # convert the plate's center-based box to pixel edges
     x1, y1, x2, y2 = box_edges(plate_box)
 
-    # add a fixed pixel margin (plates are small, a ratio-based pad would be
-    # too tiny to matter) and clamp to the vehicle crop's own bounds
-    x1 = max(int(x1) - padding_pixels, 0)
-    y1 = max(int(y1) - padding_pixels, 0)
-    x2 = min(int(x2) + padding_pixels, width)
-    y2 = min(int(y2) + padding_pixels, height)
+    # margin = the larger of a fixed pixel amount and a fraction of the plate's own
+    # height. A detector box is often a hair tight, and a clipped first/last
+    # character is the most common cause of a wrong plate read; the ratio keeps the
+    # margin meaningful for big plates while the pixel floor covers tiny ones.
+    pad = max(padding_pixels, int(round((y2 - y1) * padding_ratio)))
+
+    # clamp to the vehicle crop's own bounds
+    x1 = max(int(x1) - pad, 0)
+    y1 = max(int(y1) - pad, 0)
+    x2 = min(int(x2) + pad, width)
+    y2 = min(int(y2) + pad, height)
 
     if x2 <= x1 or y2 <= y1:
         return None
