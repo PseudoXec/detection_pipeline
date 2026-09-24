@@ -45,6 +45,57 @@ def weights_exist(path: str) -> bool:
     return os.path.isfile(path) or is_openvino_export(path) or is_ncnn_export(path)
 
 
+def resolve_inference_threads(configured: int) -> int:
+    """0 = auto: about the physical core count minus one (half the logical
+    cores, minus one), never below 2. Anything above 0 is used as given."""
+    if configured > 0:
+        return configured
+    return max(2, (os.cpu_count() or 4) // 2 - 1)
+
+
+def limit_onnx_threads(configured: int) -> Optional[int]:
+    """Cap how many CPU threads ONNX Runtime may use, for every model loaded
+    AFTER this call. Returns the cap applied, or None if nothing was changed.
+
+    Why: a 1280x1280 ONNX model on CPU keeps every core busy for over a second
+    per frame. The RTSP decoder and the live-view HTTP threads share those same
+    cores, so the video freezes during each inference and then jumps forward.
+    Leaving a few cores free keeps decoding and streaming steady, at the cost of
+    somewhat slower inference. `configured < 0` leaves ONNX Runtime untouched.
+
+    Ultralytics builds its ONNX Runtime session internally with no thread
+    option, so the cap is applied by wrapping InferenceSession's constructor.
+    """
+    if configured < 0:
+        return None
+    try:
+        import onnxruntime as ort
+    except ImportError:
+        return None          # OpenVINO / NCNN / .pt models don't use ONNX Runtime
+
+    threads = resolve_inference_threads(configured)
+    original_init = ort.InferenceSession.__init__
+    if getattr(original_init, "_thread_capped", False):
+        original_init = original_init._original      # re-configuring: don't stack wrappers
+
+    def capped_init(self, path_or_bytes, sess_options=None, *args, **kwargs):
+        if sess_options is None:
+            sess_options = ort.SessionOptions()
+        if not sess_options.intra_op_num_threads:     # respect an explicit choice
+            sess_options.intra_op_num_threads = threads
+        try:
+            # idle worker threads otherwise busy-wait, burning the cores we want free
+            sess_options.add_session_config_entry("session.intra_op.allow_spinning", "0")
+        except Exception:
+            pass
+        original_init(self, path_or_bytes, sess_options, *args, **kwargs)
+
+    capped_init._thread_capped = True
+    capped_init._original = original_init
+    ort.InferenceSession.__init__ = capped_init
+    return threads
+
+
 def load_model(weights_path: str, device: Optional[str] = None) -> YOLO:
     """Load a YOLO model, whether it's a raw .pt checkpoint, an OpenVINO
     export, or an NCNN export.

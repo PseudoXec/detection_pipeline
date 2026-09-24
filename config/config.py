@@ -100,6 +100,12 @@ class ModelConfig:
     # None = let ultralytics choose (CPU on a Pi, GPU if one is present)
     device: Optional[str] = None
 
+    # CPU threads ONNX Runtime may use for the .onnx models (ignored by
+    # OpenVINO/NCNN/.pt). 0 = auto (about physical cores - 1, min 2);
+    # -1 = no limit; N = exactly N. Lower = smoother video/live view but slower
+    # detection; raise it if detection is too slow, lower it if the video stutters.
+    inference_threads: int = 0
+
     # inference image size fed to EACH model. These are separate because a
     # static-shape NCNN export is compiled for exactly one input size -
     # if you exported vehicle.pt at --imgsz 480 (a common choice: the vehicle
@@ -261,7 +267,9 @@ class LiveConfig:
     stream_fps: float = 10.0                # max frames/second per viewer
     stream_width: int = 960                 # downscale to this width before encoding; 0 = full size
     jpeg_quality: int = 70                  # 1-100; lower = less bandwidth and CPU
-    box_max_age_seconds: float = 1.0        # boxes older than this are not drawn (detector stalled)
+    box_max_age_seconds: float = 3.0        # boxes older than this are not drawn (detector stalled)
+    box_extrapolate: bool = True            # slide boxes along each vehicle's measured speed between detections
+    box_extrapolate_max_seconds: float = 3.5  # never project further ahead than this (inference delay + gap to next detection)
     auth_token: Optional[str] = None        # if set, viewers must send it (?token= or Bearer header)
 
 

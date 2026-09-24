@@ -48,6 +48,13 @@ class DetectionPipeline:
         # once more than one Pi/camera writes into (or is compared against) the same schema
         self.camera_source = camera_source
 
+        # must run BEFORE the models load: it caps ONNX Runtime's CPU threads so
+        # inference can't starve the camera decoder and the live-view server
+        capped_threads = detector.limit_onnx_threads(config.model.inference_threads)
+        if capped_threads:
+            print(f"[pipeline] ONNX Runtime limited to {capped_threads} CPU thread(s) "
+                  f"(model.inference_threads: {config.model.inference_threads}, 0 = auto, -1 = no limit)")
+
         print("[pipeline] loading vehicle model...")
         self.vehicle_model = detector.load_model(config.model.vehicle_weights, config.model.device)
         print("[pipeline] loading plate model...")
@@ -103,6 +110,8 @@ class DetectionPipeline:
                 jpeg_quality=config.live.jpeg_quality,
                 box_max_age_seconds=config.live.box_max_age_seconds,
                 auth_token=config.live.auth_token,
+                box_extrapolate=config.live.box_extrapolate,
+                box_extrapolate_max_seconds=config.live.box_extrapolate_max_seconds,
             )
 
         # per-track_id bookkeeping so we never re-save a crop we already have,

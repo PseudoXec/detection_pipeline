@@ -11,7 +11,7 @@ camera:
   frame_width: 1280
   frame_height: 720
   capture_buffer_size: 1 # 1 = always the newest frame, never a stale queued one
-  decode_threads: 2 # cores reserved for FFmpeg's software H.264 decode
+  decode_threads: 4 # cores reserved for FFmpeg's software H.264 decode
   reconnect_delay_seconds: 5.0
   max_reconnect_attempts: 0 # 0 = retry forever (correct for 24/7 use)
 
@@ -72,7 +72,7 @@ features:
   plate_detection: true # run the plate model at all (false = log vehicles only)
   enhance_before_plate_detect: true # CLAHE + sharpen the vehicle crop before plate detection
   enhance_plate_crop: true # CLAHE + sharpen + upscale the saved plate crop
-  ocr_read: true # read plate text with OCR right after a plate crop is saved
+  ocr_read: false # read plate text with OCR right after a plate crop is saved
   save_images_to_disk: true # also keep a JPEG copy of every crop under output/
   show_preview: false # live OpenCV preview window - keep OFF on a headless Pi
   live_stream: true # SERVE live frames + boxes over HTTP; the dashboard pulls them (see live: below)
@@ -131,7 +131,7 @@ live:
   stream_fps: 10 # max frames per second per viewer
   stream_width: 960 # downscale before encoding (0 = full size); keeps the Pi's CPU free for detection
   jpeg_quality: 70
-  box_max_age_seconds: 1.0
+  box_max_age_seconds: 3
   auth_token: null # viewers must send ?token=... or "Authorization: Bearer ..."; change it if it leaks
 
   # push mode (features.live_boxes)

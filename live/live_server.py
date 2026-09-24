@@ -43,8 +43,9 @@ from live.snapshot import build_snapshot
 log = logging.getLogger("pipeline")
 
 _BOUNDARY = "frame"
-_GREEN = (0, 200, 0)       # vehicle inside the ROI (will be saved)
-_GRAY = (170, 170, 170)    # tracked but outside the ROI
+_GREEN = (0, 200, 0)       # every box is green (in_roi is still reported by /live/boxes)
+_LINE_THICKNESS = 1        # box outline, in pixels of the streamed image
+_FONT_SCALE = 0.4          # label text size
 
 
 class LiveServer:
@@ -58,6 +59,8 @@ class LiveServer:
         jpeg_quality: int = 70,
         box_max_age_seconds: float = 1.0,
         auth_token: Optional[str] = None,
+        box_extrapolate: bool = True,
+        box_extrapolate_max_seconds: float = 3.5,
     ):
         self.camera_id = camera_id
         self.host = host
@@ -67,11 +70,19 @@ class LiveServer:
         self.jpeg_quality = int(jpeg_quality)
         self.box_max_age_seconds = box_max_age_seconds
         self.auth_token = auth_token or None
+        # The detector only produces boxes every ~1-2 s on this hardware, but the
+        # video runs at ~10 fps. With extrapolation on, each box is slid along the
+        # vehicle's measured velocity (from its last two detections) so it keeps up
+        # with the picture between detections instead of jumping once per update.
+        self.box_extrapolate = box_extrapolate
+        self.box_extrapolate_max_seconds = box_extrapolate_max_seconds
         self.session_id = uuid.uuid4().hex[:8]
 
         self._frame_source: Optional[Callable[[], Any]] = None   # -> CapturedFrame | None
         self._snapshot: Optional[Dict[str, Any]] = None          # newest boxes (reference swap = atomic)
         self._seq = 0
+        self._motion: Optional[Tuple[int, float, Dict[Any, Tuple[float, ...]]]] = None   # (seq, frame time, track_id -> px/s)
+        self._prev_boxes: Optional[Tuple[float, Dict[Any, Tuple[float, ...]]]] = None    # (frame time, track_id -> box)
 
         self._enc_lock = threading.Lock()
         self._cache: Dict[bool, Tuple[Tuple, bytes]] = {}        # overlay flag -> (key, jpeg)
@@ -122,12 +133,61 @@ class LiveServer:
     ) -> None:
         try:
             self._seq += 1
-            self._snapshot = build_snapshot(
+            snapshot = build_snapshot(
                 self.camera_id, self.session_id, self._seq,
                 frame_shape, predictions, in_roi_ids, captured_at,
             )
+            if self.box_extrapolate:
+                self._motion = self._estimate_motion(snapshot)     # set BEFORE the snapshot goes live
+            self._snapshot = snapshot
         except Exception as error:
             log.debug("[live] publish skipped: %s", error)
+
+    def _estimate_motion(self, snap: Dict[str, Any]) -> Tuple[int, float, Dict[Any, Tuple[float, ...]]]:
+        """Per-track velocity (x1, y1, x2, y2 in px/s) from this snapshot vs the
+        previous one. Uses the time each FRAME was captured, not when inference
+        finished, so a slow detector doesn't distort the speed."""
+        frame_time = snap["captured_at"] if snap.get("captured_at") is not None else snap["processed_at"]
+        boxes = {
+            v["track_id"]: (v["x1"], v["y1"], v["x2"], v["y2"])
+            for v in snap["vehicles"] if v.get("track_id") is not None
+        }
+        velocities: Dict[Any, Tuple[float, ...]] = {}
+        previous = self._prev_boxes
+        if previous is not None:
+            prev_time, prev_boxes = previous
+            elapsed = frame_time - prev_time
+            if 0.05 <= elapsed <= 5.0:                 # ignore duplicate frames and long gaps
+                for track_id, box in boxes.items():
+                    old = prev_boxes.get(track_id)
+                    if old is not None:
+                        velocities[track_id] = tuple((box[i] - old[i]) / elapsed for i in range(4))
+        self._prev_boxes = (frame_time, boxes)
+        return (snap["seq"], frame_time, velocities)
+
+    def _project_boxes(self, snap: Dict[str, Any], frame_time: Optional[float]) -> List[Dict[str, Any]]:
+        """The snapshot's vehicles moved forward to the time of the frame being
+        drawn. Boxes with no velocity yet (first sighting) are drawn where they were detected."""
+        vehicles = snap["vehicles"]
+        motion = self._motion
+        if not self.box_extrapolate or motion is None or motion[0] != snap["seq"] or frame_time is None:
+            return vehicles
+        ahead = min(max(frame_time - motion[1], 0.0), self.box_extrapolate_max_seconds)
+        if ahead <= 0 or not motion[2]:
+            return vehicles
+        moved_vehicles = []
+        for v in vehicles:
+            velocity = motion[2].get(v.get("track_id"))
+            if velocity is None:
+                moved_vehicles.append(v)
+                continue
+            x1, y1 = v["x1"] + velocity[0] * ahead, v["y1"] + velocity[1] * ahead
+            x2, y2 = v["x2"] + velocity[2] * ahead, v["y2"] + velocity[3] * ahead
+            if x2 <= x1 or y2 <= y1:                   # shrinking box extrapolated to nothing: don't trust it
+                moved_vehicles.append(v)
+                continue
+            moved_vehicles.append(dict(v, x1=x1, y1=y1, x2=x2, y2=y2))
+        return moved_vehicles
 
     # ------------------------------------------------------------------ #
     # rendering (runs on the HTTP threads)
@@ -160,7 +220,7 @@ class LiveServer:
             elif overlay and snap:
                 image = image.copy()          # never draw on the camera thread's array
             if snap:
-                self._draw(image, snap)
+                self._draw(image, snap, self._project_boxes(snap, captured.captured_at))
 
             ok, buf = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality])
             if not ok:
@@ -170,18 +230,17 @@ class LiveServer:
             return result
 
     @staticmethod
-    def _draw(image, snap: Dict[str, Any]) -> None:
+    def _draw(image, snap: Dict[str, Any], vehicles: Optional[List[Dict[str, Any]]] = None) -> None:
         # boxes are in the detector frame's pixels; scale to the image we are sending
         sx = image.shape[1] / (snap["frame"]["width"] or 1)
         sy = image.shape[0] / (snap["frame"]["height"] or 1)
-        for v in snap["vehicles"]:
-            colour = _GREEN if v["in_roi"] else _GRAY
+        for v in (vehicles if vehicles is not None else snap["vehicles"]):
             p1 = (int(v["x1"] * sx), int(v["y1"] * sy))
             p2 = (int(v["x2"] * sx), int(v["y2"] * sy))
-            cv2.rectangle(image, p1, p2, colour, 2)
+            cv2.rectangle(image, p1, p2, _GREEN, _LINE_THICKNESS, cv2.LINE_AA)
             label = f'#{v["track_id"]} {v["class"]} {v["confidence"]:.2f}'
-            cv2.putText(image, label, (p1[0], max(14, p1[1] - 6)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, colour, 1, cv2.LINE_AA)
+            cv2.putText(image, label, (p1[0], max(10, p1[1] - 4)),
+                        cv2.FONT_HERSHEY_SIMPLEX, _FONT_SCALE, _GREEN, 1, cv2.LINE_AA)
 
     # ------------------------------------------------------------------ #
     def _make_handler(self):
@@ -189,6 +248,9 @@ class LiveServer:
 
         class Handler(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
+            # TCP_NODELAY: without it Windows' Nagle + delayed-ACK can hold small
+            # writes back ~40-200 ms each, which shows up as a laggy MJPEG stream.
+            disable_nagle_algorithm = True
 
             def log_message(self, *args):          # keep journald quiet
                 pass
@@ -232,6 +294,9 @@ class LiveServer:
                             "camera_id": server.camera_id,
                             "session_id": server.session_id,
                             "has_frame": cap is not None,
+                            # how old the newest camera frame is: ~0 = decoder is keeping up,
+                            # growing = the camera/decoder is the source of the lag
+                            "frame_age_seconds": round(time.time() - cap.captured_at, 2) if cap else None,
                             "boxes_age_seconds": round(time.time() - snap["processed_at"], 2) if snap else None,
                         })
 
@@ -271,11 +336,9 @@ class LiveServer:
                         time.sleep(0.03)           # nothing new yet
                         continue
                     last_key, jpeg = out
-                    self.wfile.write(
-                        f"--{_BOUNDARY}\r\nContent-Type: image/jpeg\r\nContent-Length: {len(jpeg)}\r\n\r\n".encode()
-                    )
-                    self.wfile.write(jpeg)
-                    self.wfile.write(b"\r\n")
+                    header = f"--{_BOUNDARY}\r\nContent-Type: image/jpeg\r\nContent-Length: {len(jpeg)}\r\n\r\n".encode()
+                    # ONE write per frame (header + jpeg + terminator), not three tiny ones
+                    self.wfile.write(header + jpeg + b"\r\n")
                     self.wfile.flush()
                     pause = server.min_interval - (time.monotonic() - started)
                     if pause > 0:

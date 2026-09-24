@@ -50,9 +50,13 @@ def configure_decode_threads(decode_threads: int) -> None:
     threads running alongside it and causes dropped/corrupted frames
     (visible as "Could not find ref with POC #" in OpenCV's console output).
     """
-    os.environ.setdefault(
-        "OPENCV_FFMPEG_CAPTURE_OPTIONS",
-        f"rtsp_transport;tcp|threads;{decode_threads}",
+    # Assigned (not setdefault) so a stale value left in the Windows environment
+    # can't silently switch the stream back to UDP or drop the low-latency flags.
+    # fflags;nobuffer + flags;low_delay stop FFmpeg queueing packets/frames, which
+    # is what lets a live view drift seconds behind real time whenever decoding is
+    # briefly starved by inference.
+    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
+        f"rtsp_transport;tcp|fflags;nobuffer|flags;low_delay|threads;{decode_threads}"
     )
 
 
