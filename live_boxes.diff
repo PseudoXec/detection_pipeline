@@ -1,0 +1,311 @@
+diff -ruN --strip-trailing-cr -x __pycache__ -x '*.pyc' -x models -x output -x data -x '*.md' -x '*.txt' -x '*.service' -x .gitignore /tmp/orig/config/config.py ./config/config.py
+--- /tmp/orig/config/config.py	2026-09-23 18:59:40.000000000 +0000
++++ ./config/config.py	2026-09-23 15:08:00.875370517 +0000
+@@ -235,6 +235,21 @@
+ 
+ 
+ @dataclass
++class LiveConfig:
++    """Live bounding-box feed for the command center (see live/box_publisher.py).
++
++    Only used when `features.live_boxes` is True. Boxes are sent to the
++    server, which forwards them to the WPF viewer; the video itself never
++    goes through the Pi.
++    """
++
++    endpoint_url: Optional[str] = None      # e.g. "http://server:8000/api/live/boxes"
++    camera_id: str = "cam1"                 # short, credential-free name for this camera
++    max_hz: float = 10.0                    # never send more often than this
++    timeout_seconds: float = 1.0            # short on purpose: a slow server must not pile up
++
++
++@dataclass
+ class FeaturesConfig:
+     """ONE centralized on/off switchboard for the whole pipeline.
+ 
+@@ -259,6 +274,7 @@
+     ocr_read: bool = True                        # run OCR on a saved plate crop to read its text
+     save_images_to_disk: bool = True             # also keep a JPEG copy under output/
+     show_preview: bool = False                   # live OpenCV preview window (keep OFF on a headless Pi)
++    live_boxes: bool = False                     # publish per-frame boxes to live.endpoint_url for the command center
+ 
+     # ---- per-stage timing measurement ----
+     time_vehicle_detect: bool = True
+@@ -305,6 +321,7 @@
+     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
+     features: FeaturesConfig = field(default_factory=FeaturesConfig)
+     api: ApiConfig = field(default_factory=ApiConfig)
++    live: LiveConfig = field(default_factory=LiveConfig)
+ 
+     @classmethod
+     def load(cls, yaml_path: Optional[str] = None) -> "PipelineConfig":
+diff -ruN --strip-trailing-cr -x __pycache__ -x '*.pyc' -x models -x output -x data -x '*.md' -x '*.txt' -x '*.service' -x .gitignore /tmp/orig/config/config.yaml ./config/config.yaml
+--- /tmp/orig/config/config.yaml	2026-09-23 18:59:40.000000000 +0000
++++ ./config/config.yaml	2026-09-23 15:08:00.875678078 +0000
+@@ -75,6 +75,7 @@
+   ocr_read: true                      # read plate text with OCR right after a plate crop is saved
+   save_images_to_disk: true           # also keep a JPEG copy of every crop under output/
+   show_preview: false                 # live OpenCV preview window - keep OFF on a headless Pi
++  live_boxes: false                   # publish per-frame boxes to live.endpoint_url (command center overlay)
+ 
+   # -- per-stage ms timing --
+   time_vehicle_detect: true
+@@ -111,3 +112,14 @@
+ api:
+   endpoint_url: null   # e.g. "https://dashboard.local/api/detections" - null = sends stay off/fail closed
+   timeout_seconds: 5.0
++
++# ---------------------------------------------------------------------------
++# live - per-frame bounding boxes for the command center's live view
++# ---------------------------------------------------------------------------
++# Only active when features.live_boxes is true. The camera video goes to the
++# command center directly; this only carries the boxes (small JSON).
++live:
++  endpoint_url: null    # e.g. "http://server:8000/api/live/boxes" - null = feed stays off
++  camera_id: "cam1"     # short name shown in the viewer; do NOT use the RTSP URL (it has the password)
++  max_hz: 10            # send at most this many updates per second
++  timeout_seconds: 1.0
+diff -ruN --strip-trailing-cr -x __pycache__ -x '*.pyc' -x models -x output -x data -x '*.md' -x '*.txt' -x '*.service' -x .gitignore /tmp/orig/live/box_publisher.py ./live/box_publisher.py
+--- /tmp/orig/live/box_publisher.py	1970-01-01 00:00:00.000000000 +0000
++++ ./live/box_publisher.py	2026-09-23 15:07:39.414523198 +0000
+@@ -0,0 +1,149 @@
++"""
++box_publisher.py
++----------------
++Sends the tracker's per-frame boxes to the server so the command center can
++draw them over its own copy of the video.
++
++Design rules (they exist so this can never hurt the detection loop):
++    * publish() is called from the hot loop. It only builds a tiny dict and
++      drops it in a one-slot mailbox - NO network I/O, never blocks, never raises.
++    * A separate thread does the HTTP POST. If the server is slow or down,
++      the mailbox is simply overwritten with the newest snapshot - stale
++      snapshots are never queued or replayed (latest wins).
++    * Sends are rate-limited (live.max_hz) and failures back off, so a dead
++      server costs the Pi almost nothing.
++    * Everything is behind features.live_boxes (off by default).
++"""
++
++import logging
++import threading
++import time
++import uuid
++from typing import Any, Dict, List, Optional, Set
++
++import requests
++
++log = logging.getLogger("pipeline")
++
++
++class LiveBoxPublisher:
++    def __init__(
++        self,
++        endpoint_url: str,
++        camera_id: str,
++        max_hz: float = 10.0,
++        timeout_seconds: float = 1.0,
++        idle_heartbeat_seconds: float = 1.0,
++    ):
++        self.endpoint_url = endpoint_url
++        self.camera_id = camera_id
++        # changes on every Pi restart: ByteTrack IDs restart from 1, so the
++        # consumer must key tracks by (camera_id, session_id, track_id)
++        self.session_id = uuid.uuid4().hex[:8]
++        self.min_interval = 1.0 / max_hz if max_hz > 0 else 0.0
++        self.timeout_seconds = timeout_seconds
++        self.idle_heartbeat_seconds = idle_heartbeat_seconds
++
++        self._cond = threading.Condition()
++        self._slot: Optional[Dict[str, Any]] = None   # newest unsent snapshot
++        self._seq = 0
++        self._stop_event = threading.Event()
++        self._thread: Optional[threading.Thread] = None
++
++    # ------------------------------------------------------------------ #
++    def start(self) -> "LiveBoxPublisher":
++        self._thread = threading.Thread(target=self._run, name="live-box-publisher", daemon=True)
++        self._thread.start()
++        log.info("[live] publishing boxes for %s to %s (session %s, max %.1f Hz)",
++                 self.camera_id, self.endpoint_url, self.session_id,
++                 (1.0 / self.min_interval) if self.min_interval else 0.0)
++        return self
++
++    def stop(self) -> None:
++        self._stop_event.set()
++        with self._cond:
++            self._cond.notify_all()
++        if self._thread is not None:
++            self._thread.join(timeout=2.0)
++
++    # ------------------------------------------------------------------ #
++    # called from the detection loop - must be fast and must never raise
++    # ------------------------------------------------------------------ #
++    def publish(
++        self,
++        frame_shape: tuple,
++        predictions: List[Dict[str, Any]],
++        in_roi_ids: Set[int],
++        captured_at: Optional[float] = None,
++    ) -> None:
++        try:
++            vehicles = []
++            for p in predictions:
++                half_w, half_h = p["width"] / 2.0, p["height"] / 2.0
++                vehicles.append({
++                    "track_id": p.get("track_id"),
++                    "class": p.get("class"),
++                    "confidence": round(float(p.get("confidence", 0.0)), 3),
++                    "x1": round(p["x"] - half_w, 1), "y1": round(p["y"] - half_h, 1),
++                    "x2": round(p["x"] + half_w, 1), "y2": round(p["y"] + half_h, 1),
++                    "in_roi": id(p) in in_roi_ids,
++                })
++            self._seq += 1
++            snapshot = {
++                "camera_id": self.camera_id,
++                "session_id": self.session_id,
++                "seq": self._seq,                       # gaps = dropped snapshots
++                "captured_at": captured_at,             # epoch seconds, Pi clock
++                "processed_at": time.time(),            # epoch seconds, Pi clock
++                "frame": {"width": int(frame_shape[1]), "height": int(frame_shape[0])},
++                "vehicles": vehicles,
++            }
++            with self._cond:
++                self._slot = snapshot                    # overwrite: latest wins
++                self._cond.notify()
++        except Exception as error:                       # never let this hurt the pipeline
++            log.debug("[live] publish skipped: %s", error)
++
++    # ------------------------------------------------------------------ #
++    def _run(self) -> None:
++        session = requests.Session()                     # keep-alive: no reconnect per POST
++        last_attempt = 0.0
++        last_sent = 0.0
++        last_sent_empty = False
++        failures = 0
++        last_warn = 0.0
++
++        while not self._stop_event.is_set():
++            # rate limit first, THEN grab the newest snapshot, so what we send is fresh
++            wait = self.min_interval - (time.monotonic() - last_attempt)
++            if wait > 0 and self._stop_event.wait(wait):
++                break
++
++            with self._cond:
++                if self._slot is None:
++                    self._cond.wait(timeout=0.5)
++                snapshot, self._slot = self._slot, None
++            if snapshot is None:
++                continue
++
++            # nothing on the road: send one "empty" so the viewer clears its
++            # boxes, then only a slow heartbeat so it knows the Pi is alive
++            is_empty = not snapshot["vehicles"]
++            now = time.monotonic()
++            if is_empty and last_sent_empty and now - last_sent < self.idle_heartbeat_seconds:
++                continue
++
++            last_attempt = now
++            try:
++                response = session.post(self.endpoint_url, json=snapshot, timeout=self.timeout_seconds)
++                response.raise_for_status()
++                if failures:
++                    log.info("[live] server reachable again after %d failed send(s)", failures)
++                failures = 0
++                last_sent, last_sent_empty = now, is_empty
++            except requests.RequestException as error:
++                failures += 1
++                if failures == 1 or time.monotonic() - last_warn > 30.0:
++                    log.warning("[live] send failed (%d in a row): %s", failures, error)
++                    last_warn = time.monotonic()
++                self._stop_event.wait(min(2.0, 0.2 * failures))   # back off, stay quiet
+diff -ruN --strip-trailing-cr -x __pycache__ -x '*.pyc' -x models -x output -x data -x '*.md' -x '*.txt' -x '*.service' -x .gitignore /tmp/orig/pipeline/pipeline.py ./pipeline/pipeline.py
+--- /tmp/orig/pipeline/pipeline.py	2026-09-23 18:59:40.000000000 +0000
++++ ./pipeline/pipeline.py	2026-09-23 15:08:00.875984862 +0000
+@@ -33,6 +33,7 @@
+ from pipeline.timing import VehicleTiming, Stopwatch
+ from detection.tracker import FallbackTracker, PositionDeduper, needs_fallback_tracker
+ from ocr import PlateOCRReader
++from live.box_publisher import LiveBoxPublisher
+ 
+ 
+ class DetectionPipeline:
+@@ -74,6 +75,20 @@
+             else None
+         )
+ 
++        # optional live box feed for the command center; fire-and-forget on its
++        # own thread, so a slow/dead server can never stall the detection loop
++        self.live_publisher: Optional[LiveBoxPublisher] = None
++        if config.features.live_boxes:
++            if config.live.endpoint_url:
++                self.live_publisher = LiveBoxPublisher(
++                    endpoint_url=config.live.endpoint_url,
++                    camera_id=config.live.camera_id,
++                    max_hz=config.live.max_hz,
++                    timeout_seconds=config.live.timeout_seconds,
++                ).start()
++            else:
++                print("[pipeline] features.live_boxes is on but live.endpoint_url is not set - live feed disabled")
++
+         # per-track_id bookkeeping so we never re-save a crop we already have,
+         # and so we know how many times we've tried (and failed) to find a plate
+         self._saved_vehicle_crops: Dict[str, np.ndarray] = {}
+@@ -343,7 +358,12 @@
+     # ------------------------------------------------------------------ #
+     # Public entry point: process ONE frame end to end
+     # ------------------------------------------------------------------ #
+-    def process_frame(self, frame: np.ndarray, always_finalize: bool = False) -> int:
++    def shutdown(self) -> None:
++        """Stop background helpers owned by the pipeline (currently the live box feed)."""
++        if self.live_publisher is not None:
++            self.live_publisher.stop()
++
++    def process_frame(self, frame: np.ndarray, always_finalize: bool = False, captured_at: Optional[float] = None) -> int:
+         """Runs the full Vehicle Detect -> Crop -> Plate Detect -> Crop flow
+         for one frame. Returns how many NEW vehicles were cropped this call.
+ 
+@@ -359,6 +379,9 @@
+         vehicle_predictions = self._detect_and_track_vehicles(frame)
+         # Stage 1b: drop plate-labelled boxes and anything outside our ROI/size range
+         vehicle_predictions = [p for p in vehicle_predictions if not self._looks_like_plate(p)]
++        # keep the pre-ROI list for the live feed: the operator should see
++        # vehicles approaching, flagged in_roi or not
++        all_tracked_vehicles = vehicle_predictions
+         vehicle_predictions = self._filter_to_roi(vehicle_predictions, frame_shape)
+ 
+         new_vehicle_count = 0
+@@ -382,6 +405,14 @@
+             if not already_done and not attempts_exhausted:
+                 track_ids_needing_plate.append(track_id)
+ 
++        # Live feed: publish NOW, before the (slower) plate model runs, so
++        # boxes go out at detector speed. By this point the dedup step has
++        # already remapped track_ids in place, so they match the DB rows.
++        if self.live_publisher is not None:
++            self.live_publisher.publish(
++                frame_shape, all_tracked_vehicles, {id(p) for p in vehicle_predictions}, captured_at,
++            )
++
+         # Stage 4: run the plate model, once, on every vehicle crop that needs it
+         plate_results = self._run_plate_detection(track_ids_needing_plate)
+ 
+diff -ruN --strip-trailing-cr -x __pycache__ -x '*.pyc' -x models -x output -x data -x '*.md' -x '*.txt' -x '*.service' -x .gitignore /tmp/orig/run.py ./run.py
+--- /tmp/orig/run.py	2026-09-23 18:59:40.000000000 +0000
++++ ./run.py	2026-09-23 15:08:00.876145221 +0000
+@@ -150,7 +150,7 @@
+                 continue
+             last_processed_frame_number = captured.frame_number
+ 
+-            pipeline.process_frame(captured.image)
++            pipeline.process_frame(captured.image, captured_at=captured.captured_at)
+             frames_processed += 1
+ 
+             if time.time() - last_heartbeat >= heartbeat_interval_seconds:
+@@ -241,6 +241,7 @@
+         else:
+             sys.exit("No source configured - set camera.rtsp_url, camera.image, or camera.folder in config.yaml")
+     finally:
++        pipeline.shutdown()
+         # give the background writer thread a chance to flush anything queued
+         log.info("flushing storage buffer before exit...")
+         storage.stop()

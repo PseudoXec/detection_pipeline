@@ -10,10 +10,10 @@ camera:
   rtsp_url: "rtsp://admin:Victoria2313*@192.168.100.229:554/stream1"
   frame_width: 1280
   frame_height: 720
-  capture_buffer_size: 1          # 1 = always the newest frame, never a stale queued one
-  decode_threads: 2               # cores reserved for FFmpeg's software H.264 decode
+  capture_buffer_size: 1 # 1 = always the newest frame, never a stale queued one
+  decode_threads: 4 # cores reserved for FFmpeg's software H.264 decode
   reconnect_delay_seconds: 5.0
-  max_reconnect_attempts: 0       # 0 = retry forever (correct for 24/7 use)
+  max_reconnect_attempts: 0 # 0 = retry forever (correct for 24/7 use)
 
 roi:
   x_min: 0.20
@@ -24,34 +24,34 @@ roi:
 model:
   vehicle_weights: "models/vehicle.onnx"
   plate_weights: "models/platenum_closeup.onnx"
-  device: null                    # null = auto; CPU-only unless onnxruntime-gpu is installed
-  vehicle_imgsz: 1280              # MUST match the static shape baked into vehicle.onnx (1280x1280)
-  plate_imgsz: 640                 # matches the static shape baked into platenum_closeup.onnx (640x640)
+  device: null # null = auto; CPU-only unless onnxruntime-gpu is installed
+  vehicle_imgsz: 1280 # MUST match the static shape baked into vehicle.onnx (1280x1280)
+  plate_imgsz: 640 # matches the static shape baked into platenum_closeup.onnx (640x640)
   vehicle_conf_threshold: 0.35
   plate_conf_threshold: 0.35
-  vehicle_classes: null           # e.g. "car,truck,bus,motorcycle"; null = accept all
+  vehicle_classes: null # e.g. "car,truck,bus,motorcycle"; null = accept all
 
 tracking:
-  dedup_cooldown_seconds: 2.0     # don't re-log a vehicle sitting still for this long
-  max_plate_attempts: 3           # give up looking for a plate after this many tries
+  dedup_cooldown_seconds: 2.0 # don't re-log a vehicle sitting still for this long
+  max_plate_attempts: 3 # give up looking for a plate after this many tries
 
 preprocess:
-  plate_crop_min_height: 64       # whether enhancement RUNS is under features: below
+  plate_crop_min_height: 64 # whether enhancement RUNS is under features: below
 
 ocr:
   lang: "en"
-  min_confidence: 0.5              # reads below this confidence become "Unrecognized"
+  min_confidence: 0.5 # reads below this confidence become "Unrecognized"
   unrecognized_text: "Unrecognized"
 
 storage:
-  database_path: "data/pipeline_buffer.db"   # SQLite buffer read by the C# dashboard
+  database_path: "data/pipeline_buffer.db" # SQLite buffer read by the C# dashboard
   output_dir: "output"
   jpeg_quality: 90
-  retention_days: 14                         # auto-delete synced rows older than this
+  retention_days: 14 # auto-delete synced rows older than this
 
 runtime:
   log_level: "INFO"
-  max_frames: 0                   # 0 = run forever
+  max_frames: 0 # 0 = run forever
 
 # ---------------------------------------------------------------------------
 # features
@@ -66,15 +66,17 @@ runtime:
 # instead of being computed and stored.
 features:
   # -- pipeline stages / behavior --
-  roi_filter: true                    # drop detections outside the ROI box above
-  fallback_tracker: true              # simple tracker used only if ByteTrack can't assign an ID
-  position_dedup: true                # don't re-save a vehicle that's just sitting still
-  plate_detection: true               # run the plate model at all (false = log vehicles only)
-  enhance_before_plate_detect: true   # CLAHE + sharpen the vehicle crop before plate detection
-  enhance_plate_crop: true            # CLAHE + sharpen + upscale the saved plate crop
-  ocr_read: true                      # read plate text with OCR right after a plate crop is saved
-  save_images_to_disk: true           # also keep a JPEG copy of every crop under output/
-  show_preview: false                 # live OpenCV preview window - keep OFF on a headless Pi
+  roi_filter: true # drop detections outside the ROI box above
+  fallback_tracker: true # simple tracker used only if ByteTrack can't assign an ID
+  position_dedup: true # don't re-save a vehicle that's just sitting still
+  plate_detection: true # run the plate model at all (false = log vehicles only)
+  enhance_before_plate_detect: true # CLAHE + sharpen the vehicle crop before plate detection
+  enhance_plate_crop: true # CLAHE + sharpen + upscale the saved plate crop
+  ocr_read: false # read plate text with OCR right after a plate crop is saved
+  save_images_to_disk: true # also keep a JPEG copy of every crop under output/
+  show_preview: false # live OpenCV preview window - keep OFF on a headless Pi
+  live_stream: true # SERVE live frames + boxes over HTTP; the dashboard pulls them (see live: below)
+  live_boxes: false # PUSH boxes only (JSON, no frames) to live.endpoint_url - needs a server endpoint
 
   # -- per-stage ms timing --
   time_vehicle_detect: true
@@ -83,11 +85,11 @@ features:
   time_plate_crop: true
 
   # -- console output --
-  print_console: true                 # print a line per finalized vehicle
-  print_timing: true                  # include the ms breakdown in that line
+  print_console: true # print a line per finalized vehicle
+  print_timing: true # include the ms breakdown in that line
 
   # -- SQLite storage --
-  store_to_sqlite: true               # master switch: write rows to the buffer DB at all
+  store_to_sqlite: true # master switch: write rows to the buffer DB at all
 
   # -- API delivery (placeholder until the C# dashboard endpoint exists) --
   send_via_api: true                 # POST each record to api.endpoint_url below
@@ -111,3 +113,28 @@ features:
 api:
   endpoint_url: "http://192.168.100.14:5086/api/AiDetection/PlateDetected" # e.g. "http://192.168.100.14:5086/scalar/#tag/aidetection/POST/api/AiDetection/PlateDetected" - null = sends stay off/fail closed
   timeout_seconds: 5.0
+
+# ---------------------------------------------------------------------------
+# live - live view for the command center
+# ---------------------------------------------------------------------------
+# features.live_stream: true  -> the Pi serves the video itself, nothing to configure on the server:
+#     http://<pi-ip>:8090/live/stream.mjpg   MJPEG stream (browser / WebView2 / MJPEG client)
+#     http://<pi-ip>:8090/live/frame.jpg     single JPEG (poll it)
+#     http://<pi-ip>:8090/live/boxes         latest tracker boxes as JSON
+#     add ?overlay=0 for the raw frame without boxes drawn in
+# features.live_boxes: true   -> old push mode, boxes only, needs endpoint_url below
+live:
+  camera_id: "cam1" # short name shown in the viewer; do NOT use the RTSP URL (it has the password)
+  # serve mode (features.live_stream)
+  serve_host: "0.0.0.0"
+  serve_port: 8090
+  stream_fps: 10 # max frames per second per viewer
+  stream_width: 960 # downscale before encoding (0 = full size); keeps the Pi's CPU free for detection
+  jpeg_quality: 70
+  box_max_age_seconds: 3
+  auth_token: null # viewers must send ?token=... or "Authorization: Bearer ..."; change it if it leaks
+
+  # push mode (features.live_boxes)
+  endpoint_url: null # e.g. "http://server:8000/api/live/boxes"
+  max_hz: 10
+  timeout_seconds: 1.0
