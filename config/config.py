@@ -154,7 +154,7 @@ class CropConfig:
     vehicle_padding_ratio: float = 0.08      # extra margin around a vehicle box
     vehicle_min_crop_height: int = 200       # upscale small vehicle crops to at least this
 
-    plate_padding_pixels: int = 8            # extra margin around a plate box
+    plate_padding_pixels: int = 4            # extra margin around a plate box
     plate_min_crop_height: int = 120
 
     # plate containment / IoU used to decide "which vehicle does this plate belong to"

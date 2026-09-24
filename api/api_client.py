@@ -1,17 +1,5 @@
-"""
-api_client.py
--------------
-PLACEHOLDER sender for pushing one finished detection record straight to the
-C# dashboard's API instead of (or in addition to) the SQLite buffer.
-
-The C# dev owns the real endpoint/contract; this just needs `endpoint_url`
-pointed at it once it exists. Until then this fails closed (returns False,
-logs once) so the SQLite buffer keeps working as the fallback.
-"""
-
-import base64
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 import requests
 
@@ -20,53 +8,68 @@ from storage.storage import DetectionRecord
 log = logging.getLogger("pipeline")
 
 
-def _b64(data: Optional[bytes]) -> Optional[str]:
-    return base64.b64encode(data).decode("ascii") if data else None
+def record_to_query_params(record: DetectionRecord) -> Dict[str, Any]:
+    """Maps DetectionRecord to the C# API's exact Query Parameters."""
+    
+    # Safely get OCR text if it exists, otherwise provide a fallback
+    plate_text = getattr(record, "ocr_read", "UNRECOGNIZED") if record.plate_detected else "NO_PLATE"
 
-
-def record_to_payload(record: DetectionRecord) -> Dict[str, Any]:
-    """Turns a DetectionRecord into a JSON-serializable dict. Adjust field
-    names/shape here once the C# dev shares the real request contract."""
     return {
-        "track_id": record.track_id,
-        "camera_source": record.camera_source,
-        "vehicle_class": record.vehicle_class,
-        "vehicle_confidence": record.vehicle_confidence,
-        "vehicle_image_base64": _b64(record.vehicle_image_jpeg),
-        "vehicle_box": {
-            "x1": record.vehicle_box_x1, "y1": record.vehicle_box_y1,
-            "x2": record.vehicle_box_x2, "y2": record.vehicle_box_y2,
-        } if record.vehicle_box_x1 is not None else None,
-        "plate_detected": record.plate_detected,
-        "plate_confidence": record.plate_confidence,
-        "plate_image_base64": _b64(record.plate_image_jpeg),
-        "plate_box": {
-            "x1": record.plate_box_x1, "y1": record.plate_box_y1,
-            "x2": record.plate_box_x2, "y2": record.plate_box_y2,
-        } if record.plate_box_x1 is not None else None,
-        "detected_at": record.detected_at.isoformat(sep=" ", timespec="seconds"),
-        "timing_ms": {
-            "vehicle_detect": record.vehicle_detect_ms,
-            "vehicle_crop": record.vehicle_crop_ms,
-            "plate_detect": record.plate_detect_ms,
-            "plate_crop": record.plate_crop_ms,
-            "total": record.total_pipeline_ms,
-        },
+        "PlateNumber": plate_text,
+        "CameraTargetID": 1, 
+        "DetectionConfidence": round(record.vehicle_confidence or 0.0, 2),
+        "Cameralocation": "Victoria, Tarlac",
+        "CameraIpAddress": "192.168.100.229",
+        "CameraName": "Main Camera",
+        "DetectedVehicle": record.vehicle_class or "Unknown",
+        
+        # Map Python's (x1, y1, x2, y2) bounding box format to the API's X1, X2, X3, X4 sequence
+        "VehicleBoxX1": record.vehicle_box_x1 or 0.0,
+        "VehicleBoxX2": record.vehicle_box_y1 or 0.0,
+        "VehicleBoxX3": record.vehicle_box_x2 or 0.0,
+        "VehicleBoxX4": record.vehicle_box_y2 or 0.0,
+        
+        "PlateBoxX1": record.plate_box_x1 or 0.0,
+        "PlateBoxX2": record.plate_box_y1 or 0.0,
+        "PlateBoxX3": record.plate_box_x2 or 0.0,
+        "PlateBoxX4": record.plate_box_y2 or 0.0,
+        
+        # Format explicitly to RFC 3339 (e.g., 2017-07-21T17:32:28Z)
+        "TimeStamp": record.detected_at.strftime('%Y-%m-%dT%H:%M:%SZ')
     }
 
 
 def send_detection(record: DetectionRecord, endpoint_url: str, timeout_seconds: float = 5.0) -> bool:
-    """POSTs one record to the dashboard API. Returns True on a 2xx response,
-    False on anything else (timeout, connection error, non-2xx) - the caller
-    decides what to do with the row (e.g. keep it in SQLite) when this is False."""
+    """POSTs one record to the dashboard API."""
     if not endpoint_url:
         log.warning("[api] send_via_api is on but no api.endpoint_url is configured - skipping send")
         return False
 
+    # Prevent API rejections by dropping records where no plate was found
+    if not record.plate_detected:
+        log.debug("[api] skipping send for %s: no plate detected", record.track_id)
+        return False
+
     try:
-        response = requests.post(endpoint_url, json=record_to_payload(record), timeout=timeout_seconds)
+        # Package the raw JPEG bytes as a file upload (multipart/form-data)
+        image_files = None
+        if record.plate_image_jpeg:
+            image_files = {"Image": ("plate.jpg", record.plate_image_jpeg, "image/jpeg")}
+        
+        response = requests.post(
+            endpoint_url, 
+            params=record_to_query_params(record),
+            files=image_files,
+            timeout=timeout_seconds
+        )
         response.raise_for_status()
         return True
+        
+    except requests.exceptions.HTTPError as error:
+        error_body = error.response.text if error.response is not None else "No response body"
+        log.warning("[api] failed to send %s (HTTP %s): %s", record.track_id, error.response.status_code, error_body)
+        return False
+        
     except requests.RequestException as error:
-        log.warning("[api] failed to send %s: %s", record.track_id, error)
+        log.warning("[api] network error sending %s: %s", record.track_id, error)
         return False
