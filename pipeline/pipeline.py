@@ -34,9 +34,10 @@ from detection.geometry import crop_vehicle, crop_plate, is_inside_roi, compute_
 from storage.storage import DetectionStorage, DetectionRecord
 from pipeline.timing import VehicleTiming, Stopwatch
 from detection.tracker import FallbackTracker, PositionDeduper, needs_fallback_tracker
-from ocr import PlateOCRReader
+from ocr import build_ocr_reader
 from live.box_publisher import LiveBoxPublisher
 from live.live_server import LiveServer
+from pipeline.finalize_worker import FinalizeWorkerPool, FinalizeJob
 
 log = logging.getLogger("pipeline")
 
@@ -54,8 +55,13 @@ class _PlateCandidate:
     plate_crop: np.ndarray              # enhanced plate crop (what is stored / sent)
     plate_conf: float                   # plate detector confidence
     crop_ms: Optional[float]            # time spent cutting + enhancing this crop
+    raw_crop: Optional[np.ndarray] = None    # un-enhanced plate crop, when different from plate_crop - the second
+                                              # image variant OCR tries (enhancement helps some plates, hurts others)
     ocr_text: Optional[str] = None      # cleaned plate text, None if unreadable
     ocr_score: float = 0.0              # 0..1 OCR quality (see PlateOCRReader.read_scored)
+    ocr_attempted: bool = False         # True once an OCR read has actually been run on this candidate (inline or
+                                         # in the background) - lets _build_record tell "not read yet" from "read
+                                         # and came back unreadable", so it never OCRs the same crop twice
 
     @property
     def rank(self) -> Tuple[float, float]:
@@ -117,18 +123,20 @@ class DetectionPipeline:
             position_threshold=config.tracking.dedup_position_threshold,
         )
 
-        # lazy-loaded inline OCR reader - only pays the PaddleOCR import/load
-        # cost if features.ocr_read is on and a plate is actually found
-        self.ocr_reader = (
-            PlateOCRReader(
-                lang=config.ocr.lang,
-                min_confidence=config.ocr.min_confidence,
-                allowed_chars=config.ocr.allowed_chars,
-                early_exit_score=config.ocr.early_exit_score,
-            )
-            if config.features.ocr_read
-            else None
-        )
+        # lazy-loaded OCR reader (backend picked by config.ocr.engine - see
+        # ocr/__init__.py) - only pays its model's import/load cost if
+        # features.ocr_read is on and a plate is actually found
+        self.ocr_reader = build_ocr_reader(config.ocr) if config.features.ocr_read else None
+
+        # OCR is the slowest thing this pipeline does on a Pi 5's CPU. When on,
+        # the actual read + record-build + storage handoff for a finalized vehicle
+        # run on this background pool instead of inline in process_frame, so a
+        # slow OCR call can never stall vehicle detection/tracking or the live view.
+        self.finalize_pool: Optional[FinalizeWorkerPool] = None
+        if config.features.async_ocr and self.ocr_reader is not None:
+            self.finalize_pool = FinalizeWorkerPool(
+                storage, worker_threads=config.ocr.worker_threads, max_queue=config.ocr.finalize_queue_size,
+            ).start()
 
         # optional live box feed for the command center; fire-and-forget on its
         # own thread, so a slow/dead server can never stall the detection loop
@@ -404,28 +412,40 @@ class DetectionPipeline:
             vehicle_crop=vehicle_crop, box=box, plate_crop=plate_crop,
             plate_conf=float(best_plate.get("confidence", 0.0)),
             crop_ms=sw.ms if features.time_plate_crop else None,
+            raw_crop=raw_crop if raw_crop is not plate_crop else None,
         )
 
         # OCR the enhanced crop AND the plain one: enhancement helps some plates and
         # hurts others, and the better read wins. Any failure (OCR disabled, engine
         # unavailable, low confidence, no text found) just leaves ocr_text None - it
         # never blocks or crashes the pipeline.
-        if self.ocr_reader is not None:
+        #
+        # When features.async_ocr is on, this is deliberately SKIPPED here: OCR is
+        # the slow part, and running it on every retry attempt (inline, in the hot
+        # loop) is exactly what used to stall detection/tracking. Instead the plate
+        # BOX is picked by plate-detector confidence alone (see rank/_is_good_enough
+        # below - the same fallback this pipeline already used when no OCR engine
+        # was available) and the actual read happens once, in the background, on
+        # the finally-selected crop - see _finalize_vehicle / finalize_worker.py.
+        if self.ocr_reader is not None and self.finalize_pool is None:
             try:
-                alternate = raw_crop if raw_crop is not plate_crop else None
-                candidate.ocr_text, candidate.ocr_score = self.ocr_reader.read_scored(plate_crop, alternate)
+                candidate.ocr_text, candidate.ocr_score = self.ocr_reader.read_scored(plate_crop, candidate.raw_crop)
             except Exception as error:
                 if features.print_console:
                     print(f"[pipeline] OCR read failed: {error}")
+            candidate.ocr_attempted = True
         return candidate
 
     def _is_good_enough(self, candidate: Optional[_PlateCandidate]) -> bool:
         """True when there's no point trying another frame for this vehicle."""
         if candidate is None:
             return False
-        if self.ocr_reader is None or getattr(self.ocr_reader, "_load_failed", False):
-            # no working OCR to judge readability, so fall back to the detector's own confidence
-            # (otherwise every vehicle would burn all its retries on a reader that can't read)
+        if self.finalize_pool is not None or self.ocr_reader is None or getattr(self.ocr_reader, "_load_failed", False):
+            # async mode: OCR hasn't run yet at this point (it runs once, in the
+            # background, on the crop finalize picks) so there's no OCR score to
+            # judge readability by - fall back to the plate detector's own
+            # confidence, same as when no OCR engine is available at all
+            # (otherwise every vehicle would burn all its retries pointlessly).
             return candidate.plate_conf >= self.config.model.plate_conf_threshold
         return bool(candidate.ocr_text) and candidate.ocr_score >= self.config.ocr.accept_score
 
@@ -445,10 +465,12 @@ class DetectionPipeline:
                     log.warning("could not store stale track %s: %s", track_id, error)
 
     def _finalize_vehicle(self, track_id: str, state: _TrackState) -> None:
-        """Store the vehicle with the best plate sighting collected for it (if any) and hand
-        the completed record to storage. Marks the track as finalized so it is never
-        processed again, and frees its crops."""
-        features = self.config.features
+        """Hand this vehicle's best plate sighting (if any) off to be stored. Marks the
+        track as finalized immediately (so it is never processed again) and frees its
+        crops; the actual OCR read + record build happen either right here or, when
+        features.async_ocr is on and there IS a plate to read, on a background thread
+        (see finalize_worker.py) so a slow OCR call can never stall this function's
+        caller - the real-time detection/tracking loop."""
         best = state.best
         # the plate box is relative to the crop the plate was found on, so the stored
         # vehicle image must be that same crop (it is not always the latest one)
@@ -456,19 +478,47 @@ class DetectionPipeline:
         if vehicle_crop is None:            # nothing left to store (crop already released)
             state.finalized = True
             return
-        timing = state.timing
-        base_prediction = state.prediction
+        # snapshot everything the record build needs into plain local values now,
+        # BEFORE clearing the state below - a background job must never reach back
+        # into `state` (it may be reused/pruned by the time the job actually runs)
+        timing, base_prediction, stem = state.timing, state.prediction, state.stem
+
+        if best is not None and self.finalize_pool is not None:
+            job = FinalizeJob(
+                track_id=track_id,
+                build_record=lambda: self._build_record(track_id, best, vehicle_crop, base_prediction, timing, stem),
+            )
+            if self.finalize_pool.submit(job):
+                state.finalized, state.crop, state.best = True, None, None
+                return
+            # finalize queue was full (OCR falling behind the camera) - finalize
+            # inline below instead of silently losing this vehicle
+
+        record = self._build_record(track_id, best, vehicle_crop, base_prediction, timing, stem)
+        if self.config.features.store_to_sqlite and record is not None:
+            self.storage.enqueue(record)
+        # done with this vehicle: keep the tiny state entry (so the same id is skipped
+        # while it stays in view) but release the crop pixels right away
+        state.finalized, state.crop, state.best = True, None, None
+
+    def _build_record(
+        self, track_id: str, best: Optional[_PlateCandidate], vehicle_crop: np.ndarray,
+        base_prediction: Dict[str, Any], timing: VehicleTiming, stem: str,
+    ) -> DetectionRecord:
+        """Builds the finished DetectionRecord for one vehicle: runs the OCR read (if
+        it hasn't happened yet - see _PlateCandidate.ocr_attempted), encodes the JPEGs,
+        and assembles every column. This is the part that can safely run on a
+        background thread: it only touches its own arguments, never shared pipeline
+        state, and any failure (OCR included) must never raise past this function."""
+        features = self.config.features
         # spot-check copies: the already-encoded JPEG bytes are handed to the storage
-        # writer thread, so no imwrite / second encode happens on the detection loop
+        # writer thread, so no imwrite / second encode happens here either
         disk_files: Optional[Dict[str, bytes]] = {} if features.save_images_to_disk else None
 
         plate_confidence: Optional[float] = None
         plate_image_bytes: Optional[bytes] = None
         plate_detected = False
-        plate_x1: Optional[float] = None
-        plate_y1: Optional[float] = None
-        plate_x2: Optional[float] = None
-        plate_y2: Optional[float] = None
+        plate_x1 = plate_y1 = plate_x2 = plate_y2 = None
 
         # OCR metadata - defaults cover "no plate ever found for this vehicle":
         # no OCR pass was possible, so the read is unrecognized by definition
@@ -476,13 +526,25 @@ class DetectionPipeline:
         ocr_read = self.config.ocr.unrecognized_text
 
         if best is not None:
+            # the ONE OCR read for this vehicle: if _evaluate_plate already ran it
+            # inline (features.async_ocr: false), it's already on `best` and this is
+            # skipped; otherwise it happens here - in the background when this is
+            # running as a finalize job, inline when the finalize queue was full.
+            if not best.ocr_attempted and self.ocr_reader is not None:
+                try:
+                    best.ocr_text, best.ocr_score = self.ocr_reader.read_scored(best.plate_crop, best.raw_crop)
+                except Exception as error:
+                    if features.print_console:
+                        print(f"[pipeline] OCR read failed for {track_id}: {error}")
+                best.ocr_attempted = True
+
             plate_x1, plate_y1, plate_x2, plate_y2 = best.box
             timing.plate_crop_ms = best.crop_ms
             plate_confidence = best.plate_conf
             plate_image_bytes = image_ops.encode_jpeg(best.plate_crop, self.config.storage.plate_jpeg_quality)
             plate_detected = True
             if disk_files is not None:
-                disk_files[f"plate_detection/{state.stem}_plate.jpg"] = plate_image_bytes
+                disk_files[f"plate_detection/{stem}_plate.jpg"] = plate_image_bytes
             # a plate crop exists, so an OCR read was attempted on it; an unreadable
             # one falls back to the configured "Unrecognized" text
             ocr_process = True
@@ -496,7 +558,7 @@ class DetectionPipeline:
         if features.col_vehicle_image or disk_files is not None:
             vehicle_jpeg = image_ops.encode_jpeg(vehicle_crop, self.config.storage.jpeg_quality)
             if disk_files is not None:
-                disk_files[f"vehicle_detection/{state.stem}_{self._safe_name(base_prediction.get('class'))}.jpg"] = vehicle_jpeg
+                disk_files[f"vehicle_detection/{stem}_{self._safe_name(base_prediction.get('class'))}.jpg"] = vehicle_jpeg
 
         record = DetectionRecord(
             track_id=track_id,
@@ -526,19 +588,8 @@ class DetectionPipeline:
             disk_files=disk_files,
         )
 
-        if features.store_to_sqlite:
-            self.storage.enqueue(record)
-        # done with this vehicle: keep the tiny state entry (so the same id is skipped
-        # while it stays in view) but release the crop pixels right away
-        state.finalized = True
-        state.crop = None
-        state.best = None
-
         if features.print_console:
-            if plate_detected:
-                status = f"plate found ({plate_confidence:.2f}) - ocr: {ocr_read}"
-            else:
-                status = "no plate found"
+            status = f"plate found ({plate_confidence:.2f}) - ocr: {ocr_read}" if plate_detected else "no plate found"
             if features.print_timing:
                 breakdown = (
                     f"vehicle_detect={self._fmt_ms(timing.vehicle_detect_ms)} "
@@ -551,6 +602,8 @@ class DetectionPipeline:
             else:
                 print(f"[pipeline] {track_id} finalized - {status}")
 
+        return record
+
     # ------------------------------------------------------------------ #
     # Public entry point: process ONE frame end to end
     # ------------------------------------------------------------------ #
@@ -560,6 +613,10 @@ class DetectionPipeline:
             self.live_publisher.stop()
         if self.live_server is not None:
             self.live_server.stop()
+        if self.finalize_pool is not None:
+            # lets any vehicle already accepted into the queue finish its OCR
+            # read and get stored/sent before the process exits
+            self.finalize_pool.stop()
 
     def process_frame(self, frame: np.ndarray, always_finalize: bool = False, captured_at: Optional[float] = None) -> int:
         """Runs the full Vehicle Detect -> Crop -> Plate Detect -> Crop flow

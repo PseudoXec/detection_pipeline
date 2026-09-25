@@ -207,10 +207,27 @@ class PreprocessConfig:
 
 @dataclass
 class OcrConfig:
-    """Settings for the inline plate-text OCR pass that runs right after a
-    plate crop is produced (see FeaturesConfig.ocr_read for the on/off
-    switch)."""
+    """Settings for the plate-text OCR pass that runs right after a plate
+    crop is produced (see FeaturesConfig.ocr_read for the on/off switch,
+    FeaturesConfig.async_ocr for running it off the detection loop)."""
 
+    # which OCR backend to use:
+    #   "fast_plate_ocr" (default) - small purpose-built ONNX plate classifier,
+    #       much faster on a Pi 5 CPU; assumes single-line plates (see
+    #       ocr/fast_plate_reader.py for the 2-row/motorcycle-plate caveat)
+    #   "paddleocr" - the original full detection+recognition engine; slower
+    #       per read, handles multi-row plates via fragment reordering
+    engine: str = "fast_plate_ocr"
+    # hub model fast-plate-ocr downloads/uses (only when engine: fast_plate_ocr).
+    # "-xs-" is the smallest/fastest; "cct-s-v2-global-model" trades some speed
+    # for accuracy if xs isn't reading your plates well enough
+    fast_plate_ocr_model: str = "cct-xs-v2-global-model"
+    # CPU threads the OCR engine's own inference session may use (both backends
+    # respect this). Keep at 1 on a Pi 5: OCR runs on its own worker thread(s)
+    # (ocr.worker_threads) already, and letting its native math library also
+    # spread across every core just re-creates the contention that moving it
+    # off the hot loop was meant to avoid.
+    cpu_threads: int = 1
     # language model PaddleOCR's recognizer loads
     lang: str = "en"
     # recognitions below this confidence are treated as unreadable -> "Unrecognized"
@@ -225,6 +242,15 @@ class OcrConfig:
     accept_score: float = 0.75
     # once one image variant scores this high, the other variants are not tried (saves CPU)
     early_exit_score: float = 0.85
+    # how many background threads run OCR + finalize (see FeaturesConfig.async_ocr).
+    # PaddleOCR is CPU-heavy: 1 is usually right for a Pi 5 (leaves cores for the
+    # vehicle/plate models + RTSP decode + live view); raise to 2 only if the
+    # finalize queue keeps backing up (see the "[finalize] queue full" log line)
+    # AND model.inference_threads leaves enough cores spare.
+    worker_threads: int = 1
+    # how many vehicles can be queued for OCR/finalize at once before new ones are
+    # dropped (logged loudly) rather than blocking the detection loop
+    finalize_queue_size: int = 32
 
 
 @dataclass
@@ -352,6 +378,12 @@ class FeaturesConfig:
     enhance_before_plate_detect: bool = True     # CLAHE + sharpen the vehicle crop before plate detection
     enhance_plate_crop: bool = True              # CLAHE + sharpen + upscale the saved plate crop
     ocr_read: bool = True                        # run OCR on a saved plate crop to read its text
+    async_ocr: bool = True                       # run OCR + record-build/store on background thread(s) instead of
+                                                  # inline in the detection loop - keeps the frame loop free of
+                                                  # PaddleOCR's latency; see pipeline/finalize_worker.py. The plate
+                                                  # BOX for a vehicle is still picked by plate-detector confidence
+                                                  # (not OCR quality) when this is on. Set False to restore the old
+                                                  # fully-synchronous, OCR-gated-retry behavior.
     save_images_to_disk: bool = True             # also keep a JPEG copy under output/
     show_preview: bool = False                   # live OpenCV preview window (keep OFF on a headless Pi)
     live_boxes: bool = False                     # PUSH per-frame boxes (JSON) to live.endpoint_url

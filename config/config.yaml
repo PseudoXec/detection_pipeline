@@ -27,7 +27,10 @@ model:
   vehicle_weights: "models/vehicle.onnx"
   plate_weights: "models/platenum_closeup.onnx"
   device: null # null = auto; CPU-only unless onnxruntime-gpu is installed
-  inference_threads: 3 # ONNX Runtime threads; Pi 5 = 4 cores, one is left for decode + HTTP (0 = auto, -1 = no limit)
+  inference_threads: 2 # ONNX Runtime threads for vehicle+plate models. Pi 5 = 4 cores: with OCR now on its own
+                        # background thread (ocr.worker_threads) and RTSP decode/HTTP needing headroom too, 2 keeps
+                        # detection fast without starving everything else. (0 = auto, -1 = no limit; was 3 before
+                        # OCR moved off the hot loop - bump back toward 3 only if you set features.async_ocr: false)
   vehicle_imgsz: [512, 896] # [height, width] - MUST match the static shape baked into vehicle.onnx (exported with imgsz=(512, 896))
   plate_imgsz: 640 # matches the static shape baked into platenum_closeup.onnx (640x640)
   vehicle_conf_threshold: 0.35
@@ -50,11 +53,18 @@ preprocess:
   plate_crop_min_height: 64 # whether enhancement RUNS is under features: below
 
 ocr:
-  lang: "en"
+  engine: "fast_plate_ocr" # "fast_plate_ocr" (fast, single-line-plate ONNX model) or "paddleocr" (slower, handles
+                           # stacked/2-row plates - e.g. motorcycle plates - via its own fragment reordering).
+                           # Test both against a batch of your own camera's plates before fully committing either way.
+  fast_plate_ocr_model: "cct-xs-v2-global-model" # smallest/fastest hub model; try "cct-s-v2-global-model" if accuracy needs it
+  cpu_threads: 1 # OCR engine's own inference threads - keep at 1, it already gets its own worker thread(s) below
+  lang: "en" # only used by engine: paddleocr
   min_confidence: 0.5 # reads below this confidence become "Unrecognized"
   unrecognized_text: "Unrecognized"
-  accept_score: 0.75 # OCR quality (0-1) that ends the retries for a vehicle
+  accept_score: 0.75 # OCR quality (0-1) that ends the retries for a vehicle (only used when features.async_ocr: false)
   early_exit_score: 0.85 # skip the extra image variants once one reads this well
+  worker_threads: 1 # background threads running OCR + finalize (features.async_ocr) - keep at 1 on a Pi 5 unless the finalize queue backs up
+  finalize_queue_size: 32 # vehicles that can be waiting for OCR/store at once before new ones are dropped (logged) instead of stalling detection
 
 storage:
   database_path: "data/pipeline_buffer.db" # SQLite buffer read by the C# dashboard
@@ -92,6 +102,7 @@ features:
   enhance_before_plate_detect: true # CLAHE + sharpen the vehicle crop before plate detection
   enhance_plate_crop: true # CLAHE + sharpen + upscale the saved plate crop
   ocr_read: True # read plate text with OCR right after a plate crop is saved
+  async_ocr: true # run OCR + DB/API hand-off on a background thread instead of inline in the detection loop (see ocr.worker_threads) - this is what keeps live view + tracking smooth on a Pi 5; only turn off to debug
   save_images_to_disk: true # also keep a JPEG copy of every crop under output/
   show_preview: false # live OpenCV preview window - keep OFF on a headless Pi
   live_stream: true # SERVE live frames + boxes over HTTP; the dashboard pulls them (see live: below)

@@ -81,12 +81,21 @@ class PlateOCRReader:
         min_confidence: float = 0.5,
         allowed_chars: Optional[str] = None,
         early_exit_score: float = 0.85,
+        cpu_threads: int = 1,
     ):
         self.lang = lang
         self.min_confidence = min_confidence
         self.allowed_chars = set(allowed_chars) if allowed_chars else None
         # once one image variant reads at or above this score, the remaining variants are skipped
         self.early_exit_score = early_exit_score
+        # Paddle otherwise defaults to using every core it can see for its internal
+        # OpenMP/MKL math ops - on a Pi 5 that fights the vehicle/plate model threads
+        # even though OCR runs on its own Python thread, because the contention is
+        # for CPU cores, not the GIL. Capped both ways below: the env vars affect
+        # Paddle's own thread pools, `cpu_threads` is PaddleOCR's own kwarg for it.
+        self.cpu_threads = max(1, cpu_threads)
+        os.environ.setdefault("OMP_NUM_THREADS", str(self.cpu_threads))
+        os.environ.setdefault("MKL_NUM_THREADS", str(self.cpu_threads))
         self._engine = None
         self._engine_api = "ocr"
         self._load_failed = False
@@ -119,13 +128,16 @@ class PlateOCRReader:
         # 180 degrees or bend the characters, which is what produced reversed reads.
         attempts = (
             {"use_doc_orientation_classify": False, "use_doc_unwarping": False,
-             "use_textline_orientation": True, "lang": self.lang, "enable_mkldnn": False},
+             "use_textline_orientation": True, "lang": self.lang, "enable_mkldnn": False,
+             "cpu_threads": self.cpu_threads},
             {"use_doc_orientation_classify": False, "use_doc_unwarping": False,
-             "use_textline_orientation": True, "lang": self.lang},
-            {"use_textline_orientation": True, "lang": self.lang, "enable_mkldnn": False},
-            {"use_textline_orientation": True, "lang": self.lang},
-            {"use_angle_cls": True, "lang": self.lang, "show_log": False},
-            {"lang": self.lang},
+             "use_textline_orientation": True, "lang": self.lang, "cpu_threads": self.cpu_threads},
+            {"use_textline_orientation": True, "lang": self.lang, "enable_mkldnn": False,
+             "cpu_threads": self.cpu_threads},
+            {"use_textline_orientation": True, "lang": self.lang, "cpu_threads": self.cpu_threads},
+            {"use_angle_cls": True, "lang": self.lang, "show_log": False, "cpu_threads": self.cpu_threads},
+            {"lang": self.lang, "cpu_threads": self.cpu_threads},
+            {"lang": self.lang},   # last-ditch: some point releases reject cpu_threads entirely
         )
         last_error = None
         for kwargs in attempts:
