@@ -1,0 +1,11 @@
+# Custom ByteTrack configuration for the vehicle detection pipeline.
+# Lower detection thresholds and a larger track_buffer keep tracks alive
+# across brief occlusions / ROI filter gaps that cause the default config
+# to lose and re-create IDs for the same physical vehicle.
+tracker_type: bytetrack
+track_high_thresh: 0.25   # anything >= this is a "high-quality" detection (matches stream_vehicle_conf_threshold)
+track_low_thresh: 0.05    # detections below this are ignored entirely
+new_track_thresh: 0.25    # minimum conf to initialise a brand-new track
+track_buffer:    60       # frames to keep a track alive without any detection (~2 s at 30 fps)
+match_thresh:    0.85     # generous IoU distance for re-associating lost tracks
+fuse_score:      True

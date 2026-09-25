@@ -1,0 +1,57 @@
+# detection-pipeline.service
+# ---------------------------
+# Runs the pipeline as a background service that starts on boot and
+# restarts automatically if it ever crashes - the standard way to run a
+# 24/7 process on a Raspberry Pi instead of leaving a terminal open.
+#
+# INSTALL:
+#   sudo useradd --system --no-create-home --shell /usr/sbin/nologin pipeline
+#   sudo ./secure_setup.sh          # locks down ownership/permissions - do this first
+#   sudo cp detection-pipeline.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now detection-pipeline
+#
+# LOGS:
+#   journalctl -u detection-pipeline -f
+#
+# STOP:
+#   sudo systemctl stop detection-pipeline
+
+[Unit]
+Description=Vehicle & License Plate Detection Pipeline
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# adjust this to wherever the project actually lives on the Pi
+WorkingDirectory=/home/pi/detection_pipeline
+ExecStart=/usr/bin/python3 /home/pi/detection_pipeline/run.py
+Restart=on-failure
+RestartSec=5
+
+# Runs as a dedicated, unprivileged service account instead of the "pi" user
+# (which usually has sudo + SSH login) - if the pipeline process is ever
+# compromised via a malformed frame/model input, it can't touch your SSH
+# keys, sudoers, or anything outside this project directory.
+User=pipeline
+Group=pipeline
+
+# --- sandboxing: mostly free, all enforced by the kernel/systemd ---
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+# the only paths the service is allowed to write to
+ReadWritePaths=/home/pi/detection_pipeline/data /home/pi/detection_pipeline/output
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
+# false because onnxruntime/ncnn JIT some code paths; leave true if your
+# models load fine with it on (test after enabling)
+
+[Install]
+WantedBy=multi-user.target
