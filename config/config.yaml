@@ -1,0 +1,160 @@
+# config.yaml
+# -----------
+# Every setting here has a matching default in config.py. You only need to
+# list the values you actually want to change - anything left out keeps its
+# default. This file is what you edit on the Raspberry Pi in production;
+# you should not need to touch the .py files to run day-to-day.
+
+camera:
+  # RTSP URL (with its embedded username/password) now lives in
+  # config/secrets.yaml, NOT here - this file is meant to be safe to share,
+  # screenshot, or zip up for support without leaking your camera password.
+  # See config/secrets.yaml.example for the format.
+  rtsp_url: null
+  frame_width: 1280
+  frame_height: 720
+  capture_buffer_size: 1 # 1 = always the newest frame, never a stale queued one
+  decode_threads: 2 # FFmpeg decode threads (low_delay mode mostly can't use more than this)
+  max_fps: 10 # frames/second handed to detection + live view; lower the camera's own fps too if you can
+  reconnect_delay_seconds: 5.0
+  max_reconnect_attempts: 0 # 0 = retry forever (correct for 24/7 use)
+
+roi:
+  x_min: 0.20
+  x_max: 0.80
+  y_min: 0.20
+  y_max: 0.80
+  crop_margin: 0.05 # extra frame fraction around the ROI that the vehicle model still sees (0.05 -> exactly 896x512 px on a 1280x720 stream)
+
+model:
+  vehicle_weights: "models/vehicle.onnx"
+  plate_weights: "models/platenum_closeup.onnx"
+  device: null # null = auto; CPU-only unless onnxruntime-gpu is installed
+  inference_threads: 3 # ONNX Runtime threads; Pi 5 = 4 cores, one is left for decode + HTTP (0 = auto, -1 = no limit)
+  vehicle_imgsz: [512, 896] # [height, width] - MUST match the static shape baked into vehicle.onnx (exported with imgsz=(512, 896))
+  plate_imgsz: 640 # matches the static shape baked into platenum_closeup.onnx (640x640)
+  vehicle_conf_threshold: 0.35
+  plate_conf_threshold: 0.35
+  vehicle_classes: null # e.g. "car,truck,bus,motorcycle"; null = accept all
+
+tracking:
+  dedup_cooldown_seconds: 2.0 # don't re-log a vehicle sitting still for this long
+  max_plate_attempts: 4 # plate passes per tracking ID; the best plate seen (by detector confidence) is kept, and it stops early once confident enough
+  plate_retry_interval_seconds: 0.4 # min gap between passes for the same vehicle (so each pass sees a different frame)
+  plate_stale_finalize_seconds: 1.5 # store the best-so-far once the vehicle has left the ROI this long
+  track_ttl_seconds: 30 # forget a track (and free its crop) after this long unseen
+
+crop:
+  plate_min_crop_height: 160 # upscale small plate crops to at least this tall (was 120)
+  plate_padding_pixels: 4 # minimum margin around the plate box
+  plate_padding_ratio: 0.12 # ...or this fraction of the plate height, whichever is larger
+
+preprocess:
+  plate_crop_min_height: 64 # whether enhancement RUNS is under features: below
+
+storage:
+  database_path: "data/pipeline_buffer.db" # SQLite buffer read by the C# dashboard
+  output_dir: "output"
+  jpeg_quality: 90
+  plate_jpeg_quality: 96 # plate crop only (small file); vehicle crop uses jpeg_quality
+  retention_days: 14 # auto-delete synced rows (and on-disk JPEG copies) older than this
+  max_unsynced_days: 0 # 0 = never drop rows that were not delivered yet
+  delete_disk_images_after_send: true # API mode: remove the output/ JPEGs once the record is sent (or skipped: no plate)
+  send_retry_seconds: 60 # API mode: retry failed sends this often
+
+runtime:
+  log_level: "INFO"
+  opencv_threads: 2
+  max_frames: 0 # 0 = run forever
+
+# ---------------------------------------------------------------------------
+# features
+# ---------------------------------------------------------------------------
+# ONE centralized on/off switchboard. Every optional pipeline behavior, every
+# timing measurement, console printing, and every individual SQL column is a
+# plain true/false here - nothing else in this file needs to change to turn
+# something on or off.
+#
+# A column set to false is NOT removed from the database (the schema stays
+# fixed so the C# dashboard can always rely on it) - it's just left NULL
+# instead of being computed and stored.
+features:
+  # -- pipeline stages / behavior --
+  roi_filter: true # drop detections outside the ROI box above
+  roi_crop_detect: true # run the vehicle model on the ROI (+margin) window only - needs roi_filter on
+  fallback_tracker: true # simple tracker used only if ByteTrack can't assign an ID
+  position_dedup: true # don't re-save a vehicle that's just sitting still
+  plate_detection: true # run the plate model at all (false = log vehicles only)
+  enhance_before_plate_detect: true # CLAHE + sharpen the vehicle crop before plate detection
+  enhance_plate_crop: true # CLAHE + sharpen + upscale the saved plate crop
+  save_images_to_disk: true # also keep a JPEG copy of every crop under output/
+  show_preview: false # live OpenCV preview window - keep OFF on a headless Pi
+  live_stream: true # SERVE live frames + boxes over HTTP; the dashboard pulls them (see live: below)
+  live_boxes: false # PUSH boxes only (JSON, no frames) to live.endpoint_url - needs a server endpoint
+
+  # -- per-stage ms timing --
+  time_vehicle_detect: true
+  time_vehicle_crop: true
+  time_plate_detect: true
+  time_plate_crop: true
+
+  # -- console output --
+  print_console: true # print a line per finalized vehicle
+  print_timing: true # include the ms breakdown in that line
+
+  # -- SQLite storage --
+  store_to_sqlite: true # master switch: write rows to the buffer DB at all
+
+  # -- API delivery (placeholder until the C# dashboard endpoint exists) --
+  send_via_api: true                 # POST each record to api.endpoint_url below
+  delete_row_after_api_send: true     # remove the SQLite row once the API send succeeds
+
+  # individual columns - each can be switched off independently
+  col_vehicle_image: true
+  col_vehicle_box: true
+  col_plate_image: true
+  col_plate_box: true
+  col_vehicle_detect_ms: true
+  col_vehicle_crop_ms: true
+  col_plate_detect_ms: true
+  col_plate_crop_ms: true
+  col_total_pipeline_ms: true
+
+# ---------------------------------------------------------------------------
+# api - placeholder until the C# dev provides the real endpoint
+# ---------------------------------------------------------------------------
+api:
+  # the dashboard's internal endpoint URL now lives in config/secrets.yaml
+  # too - it's not a password, but it's still internal network info (host,
+  # port, route) that has no reason to be in a file you'd casually share.
+  endpoint_url: null # null = sends stay off/fail closed
+  timeout_seconds: 5.0
+
+# ---------------------------------------------------------------------------
+# live - live view for the command center
+# ---------------------------------------------------------------------------
+# features.live_stream: true  -> the Pi serves the video itself, nothing to configure on the server:
+#     http://<pi-ip>:8090/live/stream.mjpg   MJPEG stream (browser / WebView2 / MJPEG client)
+#     http://<pi-ip>:8090/live/frame.jpg     single JPEG (poll it)
+#     http://<pi-ip>:8090/live/boxes         latest tracker boxes as JSON
+#     add ?overlay=0 for the raw frame without boxes drawn in
+# features.live_boxes: true   -> old push mode, boxes only, needs endpoint_url below
+live:
+  camera_id: "cam1" # short name shown in the viewer; do NOT use the RTSP URL (it has the password)
+  # serve mode (features.live_stream)
+  serve_host: "0.0.0.0"
+  serve_port: 8090
+  stream_fps: 10 # max frames per second per viewer
+  stream_width: 960 # downscale before encoding (0 = full size); keeps the Pi's CPU free for detection
+  jpeg_quality: 70
+  box_max_age_seconds: 3
+  # auth_token also now lives in config/secrets.yaml - a real token belongs
+  # there, not in a file that gets shared around. Leaving it null here means
+  # the live view is UNAUTHENTICATED (anyone who can reach port 8090 on your
+  # LAN can watch the camera) unless secrets.yaml sets one.
+  auth_token: null
+
+  # push mode (features.live_boxes)
+  endpoint_url: null # e.g. "http://server:8000/api/live/boxes"
+  max_hz: 10
+  timeout_seconds: 1.0
