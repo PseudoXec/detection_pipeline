@@ -1,16 +1,4 @@
-# config.yaml
-# -----------
-# Every setting here has a matching default in config.py. You only need to
-# list the values you actually want to change - anything left out keeps its
-# default. This file is what you edit on the Raspberry Pi in production;
-# you should not need to touch the .py files to run day-to-day.
-
 camera:
-  # RTSP URL (with its embedded username/password) now lives in
-  # config/secrets.yaml, NOT here - this file is meant to be safe to share,
-  # screenshot, or zip up for support without leaking your camera password.
-  # See config/secrets.yaml.example for the format.
-  rtsp_url: null
   frame_width: 1280
   frame_height: 720
   capture_buffer_size: 1 # 1 = always the newest frame, never a stale queued one
@@ -80,14 +68,7 @@ runtime:
 # ---------------------------------------------------------------------------
 # features
 # ---------------------------------------------------------------------------
-# ONE centralized on/off switchboard. Every optional pipeline behavior, every
-# timing measurement, console printing, and every individual SQL column is a
-# plain true/false here - nothing else in this file needs to change to turn
-# something on or off.
-#
-# A column set to false is NOT removed from the database (the schema stays
-# fixed so the C# dashboard can always rely on it) - it's just left NULL
-# instead of being computed and stored.
+
 features:
   # -- pipeline stages / behavior --
   roi_filter: true # drop detections outside the ROI box above
@@ -118,8 +99,8 @@ features:
   store_to_sqlite: true # master switch: write rows to the buffer DB at all
 
   # -- API delivery (placeholder until the C# dashboard endpoint exists) --
-  send_via_api: true                 # POST each record to api.endpoint_url below
-  delete_row_after_api_send: true     # remove the SQLite row once the API send succeeds
+  send_via_api: true # POST each record to api.endpoint_url below
+  delete_row_after_api_send: true # remove the SQLite row once the API send succeeds
 
   # individual columns - each can be switched off independently
   col_vehicle_image: true
@@ -134,38 +115,17 @@ features:
   col_ocr_read: true
 
 # ---------------------------------------------------------------------------
-# api - placeholder until the C# dev provides the real endpoint
-# ---------------------------------------------------------------------------
-api:
-  # the dashboard's internal endpoint URL now lives in config/secrets.yaml
-  # too - it's not a password, but it's still internal network info (host,
-  # port, route) that has no reason to be in a file you'd casually share.
-  endpoint_url: null # null = sends stay off/fail closed
-  timeout_seconds: 5.0
-
-# ---------------------------------------------------------------------------
 # live - live view for the command center
 # ---------------------------------------------------------------------------
-# features.live_stream: true  -> the Pi serves the video itself, nothing to configure on the server:
-#     http://<pi-ip>:8090/live/stream.mjpg   MJPEG stream (browser / WebView2 / MJPEG client)
-#     http://<pi-ip>:8090/live/frame.jpg     single JPEG (poll it)
-#     http://<pi-ip>:8090/live/boxes         latest tracker boxes as JSON
-#     add ?overlay=0 for the raw frame without boxes drawn in
-# features.live_boxes: true   -> old push mode, boxes only, needs endpoint_url below
+
 live:
   camera_id: "cam1" # short name shown in the viewer; do NOT use the RTSP URL (it has the password)
-  # serve mode (features.live_stream)
   serve_host: "0.0.0.0"
   serve_port: 8090
   stream_fps: 10 # max frames per second per viewer
   stream_width: 960 # downscale before encoding (0 = full size); keeps the Pi's CPU free for detection
   jpeg_quality: 70
   box_max_age_seconds: 3
-  # auth_token also now lives in config/secrets.yaml - a real token belongs
-  # there, not in a file that gets shared around. Leaving it null here means
-  # the live view is UNAUTHENTICATED (anyone who can reach port 8090 on your
-  # LAN can watch the camera) unless secrets.yaml sets one.
-  auth_token: null
 
   # push mode (features.live_boxes)
   endpoint_url: null # e.g. "http://server:8000/api/live/boxes"
