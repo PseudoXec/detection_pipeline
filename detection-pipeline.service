@@ -1,0 +1,33 @@
+# detection-pipeline.service
+# ---------------------------
+# Runs the pipeline as a background service that starts on boot and
+# restarts automatically if it ever crashes - the standard way to run a
+# 24/7 process on a Raspberry Pi instead of leaving a terminal open.
+#
+# INSTALL:
+#   sudo cp detection-pipeline.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now detection-pipeline
+#
+# LOGS:
+#   journalctl -u detection-pipeline -f
+#
+# STOP:
+#   sudo systemctl stop detection-pipeline
+
+[Unit]
+Description=Vehicle & License Plate Detection Pipeline
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# adjust this to wherever the project actually lives on the Pi
+WorkingDirectory=/home/pi/detection_pipeline
+ExecStart=/usr/bin/python3 /home/pi/detection_pipeline/run.py
+Restart=on-failure
+RestartSec=5
+User=pi
+
+[Install]
+WantedBy=multi-user.target
