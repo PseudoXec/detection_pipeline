@@ -1,0 +1,56 @@
+# ocr_config.yaml
+# ----------------
+# Every setting here has a matching default in ocr_config.py. You only need
+# to list the values you actually want to change.
+
+ocr:
+  model_name: "cct-xs-v1-global-model"  # FastPlateOCR model (or path to your own exported ONNX model)
+  lang: "en"
+  min_confidence: 0.5       # reads below this confidence become "Unrecognized"
+  unrecognized_text: "Unrecognized"      # had a plate crop, couldn't read it
+  no_plate_text: "No Plate Detected"     # vehicle never had a plate to begin with
+  early_exit_score: 0.85    # skip the enhanced variant once the raw crop reads this well
+  allowed_chars: null       # e.g. "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789" to restrict output charset
+
+preprocess:
+  enhance: true             # CLAHE + light sharpen before OCR
+  min_crop_height: 64       # crops shorter than this get upscaled first
+  try_both_variants: true   # OCR the raw crop AND the enhanced one, keep whichever scores higher
+
+input:
+  image: null               # single plate-crop image path (overridden by --image)
+  folder: null               # folder of plate-crop images (overridden by --folder)
+  recursive: false
+  extensions: [".jpg", ".jpeg", ".png", ".bmp", ".webp"]
+
+output:
+  results_csv: "output/ocr_results.csv"   # null = don't write CSV
+  results_json: null                       # e.g. "output/ocr_results.json"
+  print_console: true
+  save_annotated: false
+  annotated_dir: "output/annotated"
+
+runtime:
+  log_level: "INFO"
+  workers: 1   # keep at 1 unless you've verified your ONNX Runtime build handles concurrent .run() calls
+
+# server.py only (running this as an HTTP OCR service instead of the batch CLI)
+server:
+  host: "0.0.0.0"
+  port: 8500
+  auth_token: null               # set this and send it back as `X-API-Key` from the edge pipeline
+  max_content_length_mb: 8
+  forward_url: null             # the C# dashboard's real ingest endpoint - null = just respond, don't relay
+  forward_timeout_seconds: 5.0
+  forward_image_field: "Image"           # field name the plate image is re-attached under for the dashboard
+  forward_plate_number_field: "PlateNumber"  # query param the OCR text is added under for the dashboard
+  forward_drop_fields: ["plate_detected"]    # edge<->OCR-only bookkeeping fields stripped before forwarding
+  forward_as_json: false                 # true only if the dashboard endpoint was changed to accept JSON
+
+  # track_id de-dup / majority voting - see dedupe.py for the full explanation
+  # and its single-process limitation (only correct with one gunicorn worker,
+  # or a shared store swapped in for TrackVoteCache)
+  dedupe_enabled: true
+  dedupe_window_seconds: 150.0   # a bit more than 2x the edge's default retry interval (60s)
+  dedupe_max_entries: 5000
+  dedupe_db_path: "ocr_dedupe.sqlite3"   # shared across gunicorn workers - see dedupe.py

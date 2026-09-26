@@ -1,0 +1,14 @@
+# OCR engine
+fast-plate-ocr[onnx]
+
+# image I/O + preprocessing
+opencv-python
+numpy
+
+# config file parsing (ocr_config.yaml)
+pyyaml
+
+# server.py only: the HTTP OCR service
+flask
+requests>=2.31.0
+
