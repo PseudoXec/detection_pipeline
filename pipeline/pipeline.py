@@ -190,18 +190,26 @@ class DetectionPipeline:
             return [list(point) for point in self.config.roi.polygon]
 
     def set_roi_polygon(self, polygon: List[List[float]]) -> None:
+        new_polygon = [[float(x), float(y)] for x, y in polygon]
         with self._roi_lock:
-            self.config.roi.polygon = [[float(x), float(y)] for x, y in polygon]
+            if new_polygon == self.config.roi.polygon:
+                return
+            self.config.roi.polygon = new_polygon
             self._detect_region_shape = None
+        log.info("[roi] polygon updated: %s", new_polygon)
 
     def _refresh_roi_from_api(self) -> None:
         api, camera = self.config.api, self.config.camera
-        polygon = fetch_roi_polygon(
-            api.roi_endpoint_url, api.camera_id, api.roi_fetch_timeout_seconds,
-            pixel_mode=api.roi_coordinates_are_pixels,
-            reference_width=api.roi_reference_width or camera.frame_width,
-            reference_height=api.roi_reference_height or camera.frame_height,
-        )
+        try:
+            polygon = fetch_roi_polygon(
+                api.roi_endpoint_url, api.camera_id, api.roi_fetch_timeout_seconds,
+                pixel_mode=api.roi_coordinates_are_pixels,
+                reference_width=api.roi_reference_width or camera.frame_width,
+                reference_height=api.roi_reference_height or camera.frame_height,
+            )
+        except Exception as error:
+            log.warning("[roi] unexpected error while fetching the ROI: %s", error, exc_info=True)
+            return
         if polygon is not None:
             self.set_roi_polygon(polygon)
 
