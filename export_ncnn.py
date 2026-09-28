@@ -1,68 +1,15 @@
-"""
-export_ncnn.py
----------------
-Convert a trained YOLO .pt into an NCNN model folder, then (optionally) time
-the .pt against the export on the SAME input the live pipeline feeds it.
-No retraining: the export reuses your trained weights as-is.
-
-Why NCNN on a Raspberry Pi 5
------------------------------
-NCNN runs noticeably faster than ONNX Runtime on the Pi 5's ARM CPU
-(Ultralytics' own Pi 5 benchmarks agree), which is why it's this project's
-default export/inference format.
-
-SETUP (once)
-    pip install ncnn "pnnx==20260526"
-    (ultralytics pulls these automatically on first NCNN export too, but
-    installing them ahead of time avoids a slow, network-dependent first run)
-
-USAGE
-    # vehicle model - export at the size the pipeline actually feeds it
-    # (config.yaml model.vehicle_imgsz, e.g. 512x896 [height, width]):
-    python export_ncnn.py --weights models/vehicle.pt --imgsz 512 896 --benchmark --image sample.jpg
-
-    # plate model - config.yaml model.plate_imgsz (default 640, square):
-    python export_ncnn.py --weights models/platenum_closeup.pt --imgsz 640
-
-It prints the export folder (e.g. models/vehicle_ncnn_model). Point
-config.yaml's model.vehicle_weights / model.plate_weights at that FOLDER.
-
-FP16 (--half)
-    Halves the model's on-disk/in-memory size and is usually a modest speed
-    win on ARM. Accuracy loss is normally negligible for a detection model -
-    still worth a quick before/after check with --benchmark on a few of your
-    own images.
-
-INT8 - NOT done by this script, on purpose
---------------------------------------------
-Ultralytics' NCNN exporter (via PNNX) currently only wires up FP32/FP16 for
-NCNN - there is no single-flag "give me a calibrated INT8 NCNN model" here,
-unlike some of its other export formats. Real INT8 quantization for NCNN is a
-separate, manual step using NCNN's OWN calibration tools (`ncnn2table` +
-`ncnn2int8`, built from the NCNN C++ source - see
-https://github.com/Tencent/ncnn/wiki/quantized-int8-inference), and it needs
-50-200+ REPRESENTATIVE images of your actual camera's scenes (your vehicles,
-your lighting, your ROI) to build a calibration table that doesn't wreck
-accuracy. That's a meaningfully bigger effort than this export, and worth
-doing only after you've confirmed FP32/FP16 NCNN isn't already fast enough -
-say so if/when you want to go there and it can be scoped properly with your
-own sample images rather than guessed at here.
-"""
 import argparse
 import os
 import statistics
 import sys
 import time
 
-# Same thread budget the pipeline gives detection, so the timing comparison
-# matches real conditions. Must be set before torch loads.
 os.environ.setdefault("OMP_NUM_THREADS", str(max(1, (os.cpu_count() or 4) - 1)))
 
 import numpy as np
 
 
 def export_ncnn(weights: str, imgsz, half: bool = False) -> str:
-    """Runs ultralytics' NCNN export and returns the exported folder path."""
     from ultralytics import YOLO
 
     result = YOLO(weights).export(format="ncnn", imgsz=imgsz, half=half)
@@ -75,7 +22,6 @@ def export_ncnn(weights: str, imgsz, half: bool = False) -> str:
 
 
 def load_frame(image_path, width: int, height: int) -> np.ndarray:
-    """A real image resized to the pipeline's input size, or random noise if none given."""
     import cv2
 
     if image_path:
@@ -113,7 +59,7 @@ def main() -> None:
     parser.add_argument("--imgsz", type=int, nargs="+", default=[640],
                         help="one value for square (plate model), two for [height, width] "
                              "(vehicle model - match config.yaml model.vehicle_imgsz)")
-    parser.add_argument("--half", action="store_true", help="export FP16 instead of FP32 (see module docstring)")
+    parser.add_argument("--half", action="store_true", help="export FP16 instead of FP32")
     parser.add_argument("--benchmark", action="store_true", help="time the .pt vs the export")
     parser.add_argument("--image", default=None, help="sample image for --benchmark (recommended)")
     parser.add_argument("--input-size", default=None,
@@ -138,7 +84,7 @@ def main() -> None:
     if args.input_size:
         width, height = (int(part) for part in args.input_size.lower().split("x"))
     elif isinstance(imgsz, list):
-        height, width = imgsz            # [h, w] as config.yaml expects
+        height, width = imgsz
     else:
         width, height = imgsz, max(1, round(imgsz * 9 / 16))
     frame = load_frame(args.image, width, height)

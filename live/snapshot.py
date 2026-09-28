@@ -1,12 +1,3 @@
-"""
-snapshot.py
------------
-One place that turns the tracker's per-frame predictions into the small JSON
-dict the command center consumes. Shared by the push publisher
-(box_publisher.py) and the pull server (live_server.py) so both speak the
-exact same box format.
-"""
-
 import time
 from typing import Any, Dict, List, Optional, Set
 
@@ -20,7 +11,6 @@ def build_snapshot(
     in_roi_ids: Set[int],
     captured_at: Optional[float] = None,
 ) -> Dict[str, Any]:
-    """Boxes are in FULL-FRAME pixels (same space as detections.vehicle_box_*)."""
     vehicles = []
     for p in predictions:
         half_w, half_h = p["width"] / 2.0, p["height"] / 2.0
@@ -34,10 +24,10 @@ def build_snapshot(
         })
     return {
         "camera_id": camera_id,
-        "session_id": session_id,       # changes on every Pi restart (track ids restart at 1)
-        "seq": seq,                     # gaps = dropped snapshots
-        "captured_at": captured_at,     # epoch seconds, Pi clock
-        "processed_at": time.time(),    # epoch seconds, Pi clock
+        "session_id": session_id,
+        "seq": seq,
+        "captured_at": captured_at,
+        "processed_at": time.time(),
         "frame": {"width": int(frame_shape[1]), "height": int(frame_shape[0])},
         "vehicles": vehicles,
     }

@@ -1,19 +1,3 @@
-"""
-debug_plate.py
---------------
-Answers ONE question: "why do my vehicles come out with no plate?"
-
-It runs the plate model on a saved vehicle crop (the JPEGs the pipeline keeps
-under output/vehicle_detection/) exactly the way the live loop does, and prints
-either the detections or the exact error - so you can tell apart
-
-    * the model CRASHES on the crop        (plate_detect_ms is NULL in the DB), from
-    * the model runs but finds nothing     (plate_detect_ms would hold a number).
-
-USAGE (from the project root)
-    python debug_plate.py output/vehicle_detection/<some_crop>.jpg
-    python debug_plate.py <crop>.jpg --conf 0.10       # also try a lower threshold
-"""
 import argparse
 import sys
 import time

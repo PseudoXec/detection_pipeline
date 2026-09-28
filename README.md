@@ -215,11 +215,13 @@ dashboard **pulls** it. Turn it on with `features.live_stream: true`.
 | URL (default port 8090) | What you get |
 |---|---|
 | `/live/stream.mjpg` | MJPEG stream, boxes drawn in - opens in a browser or WebView2 `<img>` |
+| `/live/view` | ready-made page with **Boxes** and **ROI polygon** toggles - open it in a browser |
 | `/live/frame.jpg` | one JPEG - poll it (e.g. every 100 ms) from WPF |
 | `/live/boxes` | latest tracker boxes as JSON (`x1,y1,x2,y2` in full-frame pixels, `in_roi`, `track_id`) |
 | `/live/health` | `{"ok": true, ...}` liveness check |
 
 Add `?overlay=0` for the raw frame (draw your own boxes from `/live/boxes`).
+Add `?roi=1` to `/live/stream.mjpg` or `/live/frame.jpg` to draw the ROI polygon (the same one the point-in-polygon filter uses).
 If `live.auth_token` is set, send `?token=...` or `Authorization: Bearer ...`.
 
 Frames come straight from the camera thread, so video stays smooth even when
