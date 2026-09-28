@@ -68,8 +68,6 @@ class PositionDeduper:
         for track_id, entry in self._recent_saves.items():
             if now - entry["saved_at"] > self.cooldown_seconds:
                 continue
-            if box.get("class") and entry.get("class") and box["class"] != entry["class"]:
-                continue
             if compute_iou(box, entry) < _DEDUP_MIN_IOU:
                 continue
             distance = center_distance_in_widths(box, entry)
@@ -97,4 +95,5 @@ class PositionDeduper:
         if track_id in self._recent_saves:
             entry = self._recent_saves[track_id]
             entry["x"], entry["y"] = box.get("x"), box.get("y")
+            entry["width"], entry["height"] = box.get("width"), box.get("height")
             entry["saved_at"] = time.time()

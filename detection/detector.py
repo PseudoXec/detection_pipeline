@@ -190,6 +190,8 @@ def track(
     tracker_config: str,
     classes: Optional[Set[str]] = None,
     region: Optional[Tuple[int, int, int, int]] = None,
+    detect_conf: Optional[float] = None,
+    agnostic_nms: bool = False,
 ) -> List[Dict[str, Any]]:
     source = frame
     offset_x = offset_y = 0
@@ -200,9 +202,10 @@ def track(
             offset_x, offset_y = region_x1, region_y1
 
     try:
+        floor = min(conf_threshold, detect_conf) if detect_conf else conf_threshold
         results = model.track(
-            source=source, conf=conf_threshold, iou=iou_threshold, imgsz=normalize_imgsz(imgsz),
-            tracker=tracker_config, persist=True, verbose=False,
+            source=source, conf=floor, iou=iou_threshold, imgsz=normalize_imgsz(imgsz),
+            tracker=tracker_config, persist=True, agnostic_nms=agnostic_nms, verbose=False,
         )
     except Exception as error:
         raise InferenceError(f"Tracking failed: {error}") from error
@@ -225,6 +228,8 @@ def track(
     for (cx, cy, width, height), confidence, class_index, track_id in zip(xywh, confidences, class_indexes, track_ids):
         class_name = class_names.get(int(class_index), str(class_index)) if isinstance(class_names, dict) else str(class_index)
         if classes and class_name not in classes:
+            continue
+        if float(confidence) < conf_threshold:
             continue
         prediction = {
             "x": float(cx) + offset_x, "y": float(cy) + offset_y,

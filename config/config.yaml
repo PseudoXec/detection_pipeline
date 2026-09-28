@@ -32,9 +32,12 @@ model:
   vehicle_conf_threshold: 0.35
   plate_conf_threshold: 0.35
   vehicle_classes: null # e.g. "car,truck,bus,motorcycle"; null = accept all
+  agnostic_nms: true # one box per vehicle even when the model flips between classes
 
 tracking:
   dedup_cooldown_seconds: 2.0
+  detector_conf_floor: 0.10 # lets ByteTrack keep tracks alive; boxes under vehicle_conf_threshold are still dropped, 0 = off
+  plate_dedup_seconds: 30 # the same plate text is saved once per this window, 0 = off
   max_plate_attempts: 4
   plate_retry_interval_seconds: 0.4
   plate_stale_finalize_seconds: 1.5
@@ -52,6 +55,9 @@ ocr:
   fast_plate_ocr_model: "cct-xs-v2-global-model"
   cpu_threads: 1
   min_confidence: 0.5
+  plate_formats: ["LLLDDDD"] # L = letter, D = digit: ABC 1234. Add "LLLDDD" for older plates, "DDDLLL" for some motorcycles
+  plate_format_strict: true # true = reads that fit no format become Unrecognized
+  plate_separator: " " # placed between letter and digit groups, "" for none
   unrecognized_text: "Unrecognized"
   accept_score: 0.75
   early_exit_score: 0.85

@@ -124,6 +124,9 @@ class DetectionPipeline:
             )
 
         self._tracks: Dict[str, _TrackState] = {}
+        self._aliases: Dict[str, str] = {}
+        self._recent_plates: Dict[str, float] = {}
+        self._plate_lock = threading.Lock()
         self._last_prune = time.monotonic()
         self._session_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
         self._detect_region: Optional[Tuple[int, int, int, int]] = None
@@ -237,6 +240,8 @@ class DetectionPipeline:
                 model_cfg.vehicle_conf_threshold, model_cfg.vehicle_iou_threshold,
                 model_cfg.vehicle_imgsz, tracking_cfg.bytetrack_config, self.vehicle_classes,
                 region=region,
+                detect_conf=tracking_cfg.detector_conf_floor or None,
+                agnostic_nms=model_cfg.agnostic_nms,
             )
         self._last_vehicle_detect_ms = sw.ms if features.time_vehicle_detect else None
 
@@ -274,13 +279,25 @@ class DetectionPipeline:
                 self.deduper.refresh(track_id, prediction)
             return track_id, False
 
+        canonical_id = self._aliases.get(track_id)
+        if canonical_id is not None and canonical_id in self._tracks:
+            prediction["track_id"] = canonical_id
+            state = self._tracks[canonical_id]
+            state.last_seen = now
+            state.prediction = prediction
+            if features.position_dedup:
+                self.deduper.refresh(canonical_id, prediction)
+            return canonical_id, False
+
         if features.position_dedup:
             existing_track_id = self.deduper.find_existing_track(prediction)
             if existing_track_id is not None and existing_track_id in self._tracks:
+                self._aliases[track_id] = existing_track_id
                 prediction["track_id"] = existing_track_id
                 state = self._tracks[existing_track_id]
                 state.last_seen = now
                 state.prediction = prediction
+                self.deduper.refresh(existing_track_id, prediction)
                 return existing_track_id, False
 
         crop_cfg = self.config.crop
@@ -412,7 +429,7 @@ class DetectionPipeline:
     def _build_record(
         self, track_id: str, best: Optional[_PlateCandidate], vehicle_crop: np.ndarray,
         base_prediction: Dict[str, Any], timing: VehicleTiming, stem: str,
-    ) -> DetectionRecord:
+    ) -> Optional[DetectionRecord]:
         features = self.config.features
         disk_files: Optional[Dict[str, bytes]] = {} if features.save_images_to_disk else None
 
@@ -442,6 +459,11 @@ class DetectionPipeline:
                 disk_files[f"plate_detection/{stem}_plate.jpg"] = plate_image_bytes
             ocr_process = True
             ocr_read = best.ocr_text if best.ocr_text else self.config.ocr.unrecognized_text
+
+        if best is not None and best.ocr_text and self._is_duplicate_plate(best.ocr_text):
+            log.info("[pipeline] %s dropped - plate %s was already recorded in the last %.0fs",
+                     track_id, best.ocr_text, self.config.tracking.plate_dedup_seconds)
+            return None
 
         vehicle_x1, vehicle_y1, vehicle_x2, vehicle_y2 = box_edges(base_prediction)
 
@@ -494,6 +516,19 @@ class DetectionPipeline:
                 print(f"[pipeline] {track_id} finalized - {status}")
 
         return record
+
+    def _is_duplicate_plate(self, text: str) -> bool:
+        window = self.config.tracking.plate_dedup_seconds
+        if window <= 0:
+            return False
+        key = "".join(ch for ch in text.upper() if ch.isalnum())
+        now = time.monotonic()
+        with self._plate_lock:
+            for stale in [k for k, seen in self._recent_plates.items() if now - seen > window]:
+                del self._recent_plates[stale]
+            duplicate = key in self._recent_plates
+            self._recent_plates[key] = now
+        return duplicate
 
     def shutdown(self) -> None:
         self._roi_poll_stop.set()
@@ -586,6 +621,7 @@ class DetectionPipeline:
                 except Exception as error:
                     log.warning("could not store expired track %s: %s", track_id, error)
             del self._tracks[track_id]
+        self._aliases = {alias: target for alias, target in self._aliases.items() if target in self._tracks}
         self.deduper.prune()
 
     @staticmethod

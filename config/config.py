@@ -68,6 +68,7 @@ class ModelConfig:
     plate_conf_threshold: float = 0.35
 
     vehicle_classes: Optional[str] = None
+    agnostic_nms: bool = True
 
 
 @dataclass
@@ -80,6 +81,8 @@ class TrackingConfig:
 
     dedup_cooldown_seconds: float = 2.0
     dedup_position_threshold: float = 1.0
+    detector_conf_floor: float = 0.10
+    plate_dedup_seconds: float = 30.0
 
     max_plate_attempts: int = 1
     plate_retry_interval_seconds: float = 0.4
@@ -109,6 +112,9 @@ class OcrConfig:
     cpu_threads: int = 1
     min_confidence: float = 0.5
     allowed_chars: str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    plate_formats: List[str] = field(default_factory=lambda: ["LLLDDDD"])
+    plate_format_strict: bool = True
+    plate_separator: str = " "
     unrecognized_text: str = "Unrecognized"
     accept_score: float = 0.75
     early_exit_score: float = 0.85
