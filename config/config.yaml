@@ -119,13 +119,13 @@ features:
   col_ocr_read: true
 
 api:
-  enabled: false # master switch: off = no ROI fetch, no camera source fetch, no data sending
+  enabled: true # master switch: off = no ROI fetch, no camera source fetch, no data sending
   endpoint_url: "http://192.168.100.14:5086/api/AiDetection/PlateDetected"
   timeout_seconds: 5.0
 
   roi_endpoint_url: "http://192.168.100.14:5086/api/AiDetection/roi-coordinates"
-  camera_id: 1
-  roi_fetch_timeout_seconds: 5.0
+  camera_id: 4
+  roi_fetch_timeout_seconds: 3.0
   roi_poll_interval_seconds: 30.0
   roi_coordinates_are_pixels: false
   roi_reference_width: null
