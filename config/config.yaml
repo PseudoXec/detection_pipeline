@@ -128,8 +128,8 @@ api:
   roi_fetch_timeout_seconds: 3.0
   roi_poll_interval_seconds: 30.0
   roi_coordinates_are_pixels: false
-  roi_reference_width: null
-  roi_reference_height: null
+  roi_reference_width: 1920
+  roi_reference_height: 1080
 
 live:
   camera_id: "cam1"

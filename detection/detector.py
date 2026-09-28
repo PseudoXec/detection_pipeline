@@ -1,10 +1,99 @@
+import logging
 import os
+import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 from ultralytics import YOLO
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+
+log = logging.getLogger("pipeline")
+
+# ---- box stabiliser -------------------------------------------------------------------------
+# ByteTrack reports its own smoothed (Kalman) box. When a track gets matched to a wrong / merged
+# detection that box can suddenly become huge (or tiny) for a single update. A real vehicle only
+# changes size gradually, so the size of each track may change by at most this factor per update.
+MAX_SIZE_STEP = 1.35        # width/height may grow at most 35 % (or shrink to 1/1.35) per update
+SIZE_MEMORY_SECONDS = 1.5   # a track not seen for this long starts fresh (no clamping)
+SIZE_PRUNE_SECONDS = 30.0
+MAX_FRAME_FRACTION = 0.80   # a box wider/taller than this share of the frame is never a single vehicle
+
+# ---- tracker lag ------------------------------------------------------------------------------
+# Stock ByteTrack trusts its constant-velocity model much more than the newest detection, so the
+# reported box trails a moving vehicle. A larger velocity noise makes it follow the detector faster
+# (stock is 1/160). Set to None to leave ultralytics untouched.
+KALMAN_VELOCITY_WEIGHT: Optional[float] = 1.0 / 50
+
+
+def tune_tracker_kalman(velocity_weight: Optional[float] = KALMAN_VELOCITY_WEIGHT) -> bool:
+    """Make ByteTrack follow the detector more closely. Safe no-op if ultralytics' internals differ."""
+    if not velocity_weight:
+        return False
+    try:
+        from ultralytics.trackers import byte_tracker
+        from ultralytics.trackers.utils import kalman_filter
+        filter_cls = kalman_filter.KalmanFilterXYAH
+        if getattr(filter_cls, "_lag_tuned", False):
+            return True
+
+        original_init = filter_cls.__init__
+
+        def tuned_init(self, *args, **kwargs):
+            original_init(self, *args, **kwargs)
+            self._std_weight_velocity = velocity_weight
+
+        filter_cls.__init__ = tuned_init
+        filter_cls._lag_tuned = True
+        shared = getattr(byte_tracker.STrack, "shared_kalman", None)  # already built at import time
+        if shared is not None:
+            shared._std_weight_velocity = velocity_weight
+        return True
+    except Exception as error:  # different ultralytics version - keep stock behaviour
+        log.warning("[detector] could not tune the tracker's Kalman filter (%s) - using stock ByteTrack", error)
+        return False
+
+
+class BoxStabilizer:
+    """Per-track size gate: stops one bad update from turning a small vehicle into a giant box."""
+
+    def __init__(self, max_step: float = MAX_SIZE_STEP, memory_seconds: float = SIZE_MEMORY_SECONDS):
+        self.max_step = max_step
+        self.memory_seconds = memory_seconds
+        self._last: Dict[str, Tuple[float, float, float]] = {}   # track_id -> (w, h, time)
+        self._last_prune = time.monotonic()
+
+    def apply(self, prediction: Dict[str, Any], frame_w: float, frame_h: float, now: float) -> bool:
+        """Clamp the prediction in place. Returns False if it should be dropped entirely."""
+        width, height = prediction["width"], prediction["height"]
+        if width <= 1 or height <= 1:
+            return False
+        if width > MAX_FRAME_FRACTION * frame_w or height > MAX_FRAME_FRACTION * frame_h:
+            return False
+
+        track_id = prediction.get("track_id")
+        if track_id is None:
+            return True
+
+        previous = self._last.get(track_id)
+        if previous is not None and now - previous[2] <= self.memory_seconds:
+            prev_w, prev_h = previous[0], previous[1]
+            new_w = min(max(width, prev_w / self.max_step), prev_w * self.max_step)
+            new_h = min(max(height, prev_h / self.max_step), prev_h * self.max_step)
+            if new_w != width or new_h != height:
+                log.debug("[detector] %s size %.0fx%.0f -> %.0fx%.0f (was %.0fx%.0f)",
+                          track_id, width, height, new_w, new_h, prev_w, prev_h)
+                prediction["width"], prediction["height"] = new_w, new_h
+                width, height = new_w, new_h
+        self._last[track_id] = (width, height, now)
+
+        if now - self._last_prune > SIZE_PRUNE_SECONDS:
+            self._last_prune = now
+            self._last = {t: v for t, v in self._last.items() if now - v[2] <= SIZE_PRUNE_SECONDS}
+        return True
+
+
+_stabilizer = BoxStabilizer()
 
 
 class InferenceError(RuntimeError):
@@ -193,6 +282,7 @@ def track(
     detect_conf: Optional[float] = None,
     agnostic_nms: bool = False,
 ) -> List[Dict[str, Any]]:
+    tune_tracker_kalman()
     source = frame
     offset_x = offset_y = 0
     if region is not None:
@@ -224,6 +314,7 @@ def track(
     class_indexes = boxes.cls.cpu().numpy().astype(int)
     track_ids = boxes.id.int().cpu().tolist() if boxes.id is not None else [None] * len(xywh)
 
+    now = time.monotonic()
     predictions: List[Dict[str, Any]] = []
     for (cx, cy, width, height), confidence, class_index, track_id in zip(xywh, confidences, class_indexes, track_ids):
         class_name = class_names.get(int(class_index), str(class_index)) if isinstance(class_names, dict) else str(class_index)
@@ -238,6 +329,8 @@ def track(
         }
         if track_id is not None:
             prediction["track_id"] = f"v{int(track_id)}"
+        if not _stabilizer.apply(prediction, frame.shape[1], frame.shape[0], now):
+            continue
         predictions.append(prediction)
 
     return predictions

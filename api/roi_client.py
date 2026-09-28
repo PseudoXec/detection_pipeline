@@ -22,7 +22,7 @@ was the visible symptom of several different mismatches:
 * all-zero / null values (the endpoint's "not set yet" state) are now reported
   clearly instead of producing a degenerate ROI.
 * the request now sends `?id=<camera_id>` (the endpoint rejects `cameraId` with
-  400 "invalid camera Id"), and warns if the response's own cameraId doesn't match.
+  400 "invalid camera Id"), and notes (debug log) if the response's own cameraId doesn't match.
 * every fetch outcome is logged, including the raw response the first time and
   whenever it changes, so a mismatch is visible in the log.
 """
@@ -226,9 +226,10 @@ def _warn_on_camera_mismatch(body: Any, requested_id: Any) -> None:
     returned = _flatten(body).get("cameraid")
     try:
         if returned is not None and int(returned) != int(requested_id):
-            log.warning("[roi] asked for camera %s but the response says cameraId=%s - the command "
-                        "center probably has no ROI saved for camera %s and sent a blank record",
-                        requested_id, returned, requested_id)
+            # some command-center builds always echo cameraId 0 even with a real ROI, so this is
+            # only a hint (debug); a blank record is caught separately by the degenerate-ROI check
+            log.debug("[roi] asked for camera %s but the response says cameraId=%s",
+                      requested_id, returned)
     except (TypeError, ValueError):
         pass
 

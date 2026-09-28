@@ -19,9 +19,12 @@ log = logging.getLogger("pipeline")
 
 _BOUNDARY = "frame"
 _GREEN = (0, 200, 0)
+_GREY = (140, 140, 140)  # vehicles outside the ROI (only drawn when asked for)
 _LINE_THICKNESS = 1
 _FONT_SCALE = 0.4
 _BLEND_SECONDS = 0.4
+_MAX_EXTRAPOLATE_SECONDS = 0.8   # never project a box further ahead than this, however old the detection
+_MIN_MOTION_INTERVAL = 0.08     # detections closer together than this give noisy velocities
 _ROI_COLOR = (0, 200, 255)
 _ROI_THICKNESS = 2
 
@@ -37,24 +40,29 @@ img{display:block;max-width:100%;margin:0 auto}
 <header>
 <label><input type="checkbox" id="boxes"> Boxes</label>
 <label><input type="checkbox" id="roi"> ROI polygon</label>
+<label><input type="checkbox" id="outside"> Vehicles outside ROI</label>
 </header>
 <img id="view" alt="live stream">
 <script>
 var q = new URLSearchParams(location.search);
 var boxes = document.getElementById("boxes");
 var roi = document.getElementById("roi");
+var outside = document.getElementById("outside");
 var view = document.getElementById("view");
 boxes.checked = q.get("overlay") !== "0";
 roi.checked = q.get("roi") === "1";
+outside.checked = q.get("outside") === "1";
 function load() {
   var p = new URLSearchParams();
   p.set("overlay", boxes.checked ? "1" : "0");
   p.set("roi", roi.checked ? "1" : "0");
+  p.set("outside", outside.checked ? "1" : "0");
   if (q.get("token")) p.set("token", q.get("token"));
   view.src = "/live/stream.mjpg?" + p.toString();
 }
 boxes.onchange = load;
 roi.onchange = load;
+outside.onchange = load;
 load();
 </script></body></html>
 """
@@ -88,6 +96,7 @@ class LiveServer:
         self.box_extrapolate = box_extrapolate
         self.box_extrapolate_max_seconds = box_extrapolate_max_seconds
         self._flow: Optional[BoxFlow] = BoxFlow() if box_visual_tracking else None
+        self._motion_velocity: Dict[Any, Tuple[float, ...]] = {}
         self._shown: Dict[Any, Dict[str, Any]] = {}
         self.session_id = uuid.uuid4().hex[:8]
 
@@ -154,22 +163,33 @@ class LiveServer:
             log.debug("[live] publish skipped: %s", error)
 
     def _estimate_motion(self, snap: Dict[str, Any]) -> Tuple[int, float, Dict[Any, Tuple[float, ...]]]:
+        """Per-track CENTRE velocity (px/s). Size is never extrapolated - only the position moves."""
         frame_time = snap["captured_at"] if snap.get("captured_at") is not None else snap["processed_at"]
-        boxes = {
-            v["track_id"]: (v["x1"], v["y1"], v["x2"], v["y2"])
+        centres = {
+            v["track_id"]: ((v["x1"] + v["x2"]) / 2.0, (v["y1"] + v["y2"]) / 2.0,
+                            v["x2"] - v["x1"], v["y2"] - v["y1"])
             for v in snap["vehicles"] if v.get("track_id") is not None
         }
         velocities: Dict[Any, Tuple[float, ...]] = {}
         previous = self._prev_boxes
         if previous is not None:
-            prev_time, prev_boxes = previous
+            prev_time, prev_centres = previous
             elapsed = frame_time - prev_time
-            if 0.05 <= elapsed <= 5.0:
-                for track_id, box in boxes.items():
-                    old = prev_boxes.get(track_id)
-                    if old is not None:
-                        velocities[track_id] = tuple((box[i] - old[i]) / elapsed for i in range(4))
-        self._prev_boxes = (frame_time, boxes)
+            if _MIN_MOTION_INTERVAL <= elapsed <= 2.0:
+                for track_id, (cx, cy, w, h) in centres.items():
+                    old = prev_centres.get(track_id)
+                    if old is None:
+                        continue
+                    vx, vy = (cx - old[0]) / elapsed, (cy - old[1]) / elapsed
+                    earlier = self._motion_velocity.get(track_id)
+                    if earlier is not None:  # blend with the last estimate so one noisy frame can't fling the box
+                        vx, vy = 0.6 * vx + 0.4 * earlier[0], 0.6 * vy + 0.4 * earlier[1]
+                    # a vehicle can't plausibly cross more than ~3 of its own sizes per second
+                    vx = max(-3.0 * max(w, 1.0), min(3.0 * max(w, 1.0), vx))
+                    vy = max(-3.0 * max(h, 1.0), min(3.0 * max(h, 1.0), vy))
+                    velocities[track_id] = (vx, vy)
+        self._motion_velocity = dict(velocities)
+        self._prev_boxes = (frame_time, centres)
         return (snap["seq"], frame_time, velocities)
 
     def _project_boxes(self, snap: Dict[str, Any], frame_time: Optional[float]) -> List[Dict[str, Any]]:
@@ -177,7 +197,7 @@ class LiveServer:
         motion = self._motion
         if not self.box_extrapolate or motion is None or motion[0] != snap["seq"] or frame_time is None:
             return vehicles
-        ahead = min(max(frame_time - motion[1], 0.0), self.box_extrapolate_max_seconds)
+        ahead = min(max(frame_time - motion[1], 0.0), self.box_extrapolate_max_seconds, _MAX_EXTRAPOLATE_SECONDS)
         if ahead <= 0 or not motion[2]:
             return vehicles
         moved_vehicles = []
@@ -186,12 +206,11 @@ class LiveServer:
             if velocity is None:
                 moved_vehicles.append(v)
                 continue
-            x1, y1 = v["x1"] + velocity[0] * ahead, v["y1"] + velocity[1] * ahead
-            x2, y2 = v["x2"] + velocity[2] * ahead, v["y2"] + velocity[3] * ahead
-            if x2 <= x1 or y2 <= y1:
-                moved_vehicles.append(v)
-                continue
-            moved_vehicles.append(dict(v, x1=x1, y1=y1, x2=x2, y2=y2))
+            width, height = v["x2"] - v["x1"], v["y2"] - v["y1"]
+            # same shift for both edges -> the box keeps its size; never move it more than half its own size
+            dx = max(-0.5 * width, min(0.5 * width, velocity[0] * ahead))
+            dy = max(-0.5 * height, min(0.5 * height, velocity[1] * ahead))
+            moved_vehicles.append(dict(v, x1=v["x1"] + dx, y1=v["y1"] + dy, x2=v["x2"] + dx, y2=v["y2"] + dy))
         return moved_vehicles
 
     def _fresh_boxes(self) -> Optional[Dict[str, Any]]:
@@ -200,7 +219,7 @@ class LiveServer:
             return None
         return snap
 
-    def _render(self, overlay: bool, roi: bool = False) -> Optional[Tuple[Tuple, bytes]]:
+    def _render(self, overlay: bool, roi: bool = False, outside: bool = False) -> Optional[Tuple[Tuple, bytes]]:
         captured = self._frame_source() if self._frame_source else None
         if captured is None:
             return None
@@ -212,7 +231,7 @@ class LiveServer:
         key = (captured.frame_number, snap["seq"] if snap else 0, roi_signature)
 
         with self._enc_lock:
-            cached = self._cache.get((overlay, roi))
+            cached = self._cache.get((overlay, roi, outside))
             if cached and cached[0] == key:
                 return cached
 
@@ -238,7 +257,7 @@ class LiveServer:
                 except Exception as error:
                     self._disable_flow(error)
                     vehicles = snap["vehicles"]
-                self._draw(image, snap, vehicles)
+                self._draw(image, snap, vehicles, outside)
             else:
                 self._shown.clear()
 
@@ -246,7 +265,7 @@ class LiveServer:
             if not ok:
                 return None
             result = (key, buf.tobytes())
-            self._cache[(overlay, roi)] = result
+            self._cache[(overlay, roi, outside)] = result
             return result
 
     def _disable_flow(self, error: Exception) -> None:
@@ -308,16 +327,21 @@ class LiveServer:
                         cv2.FONT_HERSHEY_SIMPLEX, _FONT_SCALE, _ROI_COLOR, 1, cv2.LINE_AA)
 
     @staticmethod
-    def _draw(image, snap: Dict[str, Any], vehicles: Optional[List[Dict[str, Any]]] = None) -> None:
+    def _draw(image, snap: Dict[str, Any], vehicles: Optional[List[Dict[str, Any]]] = None,
+              show_outside: bool = False) -> None:
         sx = image.shape[1] / (snap["frame"]["width"] or 1)
         sy = image.shape[0] / (snap["frame"]["height"] or 1)
         for v in (vehicles if vehicles is not None else snap["vehicles"]):
+            inside = v.get("in_roi", True)
+            if not inside and not show_outside:
+                continue  # the pipeline ignores this vehicle, so don't show it as if it were being read
+            color = _GREEN if inside else _GREY
             p1 = (int(v["x1"] * sx), int(v["y1"] * sy))
             p2 = (int(v["x2"] * sx), int(v["y2"] * sy))
-            cv2.rectangle(image, p1, p2, _GREEN, _LINE_THICKNESS, cv2.LINE_AA)
+            cv2.rectangle(image, p1, p2, color, _LINE_THICKNESS, cv2.LINE_AA)
             label = f'#{v["track_id"]} {v["class"]} {v["confidence"]:.2f}'
             cv2.putText(image, label, (p1[0], max(10, p1[1] - 4)),
-                        cv2.FONT_HERSHEY_SIMPLEX, _FONT_SCALE, _GREEN, 1, cv2.LINE_AA)
+                        cv2.FONT_HERSHEY_SIMPLEX, _FONT_SCALE, color, 1, cv2.LINE_AA)
 
     def _make_handler(self):
         server = self
@@ -358,6 +382,7 @@ class LiveServer:
                         return self._json(401, {"error": "unauthorized"})
                     overlay = query.get("overlay", ["1"])[0] not in ("0", "false", "no")
                     roi = query.get("roi", ["0"])[0] in ("1", "true", "yes")
+                    outside = query.get("outside", ["0"])[0] in ("1", "true", "yes")
 
                     if url.path == "/live/health":
                         snap = server._snapshot
@@ -378,13 +403,13 @@ class LiveServer:
                         return self._json(200, dict(snap, age_seconds=round(time.time() - snap["processed_at"], 3)))
 
                     if url.path == "/live/frame.jpg":
-                        out = server._render(overlay, roi)
+                        out = server._render(overlay, roi, outside)
                         if out is None:
                             return self._json(503, {"error": "no frame from camera yet"})
                         return self._send(200, out[1], "image/jpeg")
 
                     if url.path == "/live/stream.mjpg":
-                        return self._stream(overlay, roi)
+                        return self._stream(overlay, roi, outside)
 
                     if url.path == "/live/view":
                         return self._send(200, _VIEWER_HTML.encode(), "text/html; charset=utf-8")
@@ -433,7 +458,7 @@ class LiveServer:
                 log.info("[live] ROI polygon updated by front end (%d points)", len(points))
                 return self._json(200, {"ok": True, "polygon": [list(p) for p in points]})
 
-            def _stream(self, overlay: bool, roi: bool) -> None:
+            def _stream(self, overlay: bool, roi: bool, outside: bool = False) -> None:
                 self.send_response(200)
                 self.send_header("Content-Type", f"multipart/x-mixed-replace; boundary={_BOUNDARY}")
                 self.send_header("Cache-Control", "no-store")
@@ -445,7 +470,7 @@ class LiveServer:
                 last_key = None
                 while not server._stop_event.is_set():
                     started = time.monotonic()
-                    out = server._render(overlay, roi)
+                    out = server._render(overlay, roi, outside)
                     if out is None or out[0] == last_key:
                         time.sleep(0.03)
                         continue

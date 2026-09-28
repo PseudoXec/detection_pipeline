@@ -2,6 +2,7 @@ tracker_type: bytetrack
 track_high_thresh: 0.25
 track_low_thresh: 0.05
 new_track_thresh: 0.25
-track_buffer: 60
-match_thresh: 0.85
+track_buffer: 30        # was 60 - a lost track can be re-attached to a wrong detection for this many frames
+match_thresh: 0.75      # was 0.85 - 0.85 let a track match a detection overlapping it by only ~15%, which is how
+                        # a small vehicle's track ends up on a big merged box. Lower = stricter matching
 fuse_score: True
