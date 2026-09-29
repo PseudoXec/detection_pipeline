@@ -1,3 +1,4 @@
+import logging
 import os
 import threading
 import time
@@ -6,6 +7,8 @@ from typing import Optional
 
 import cv2
 import numpy as np
+
+log = logging.getLogger("pipeline")
 
 
 @dataclass
@@ -46,6 +49,7 @@ class ThreadedRTSPCamera:
         self._frame_counter = 0
         self._capture: Optional[cv2.VideoCapture] = None
         self._thread: Optional[threading.Thread] = None
+        self._logged_actual_size = False
 
     def start(self) -> "ThreadedRTSPCamera":
         try:
@@ -73,6 +77,7 @@ class ThreadedRTSPCamera:
             raise RuntimeError(f"Could not open RTSP stream: {self.rtsp_url}")
 
         self._capture = capture
+        self._logged_actual_size = False  # log again on every (re)connect - the camera may have changed profile
 
     def _grab_loop(self) -> None:
         consecutive_failures = 0
@@ -100,10 +105,31 @@ class ThreadedRTSPCamera:
             consecutive_failures = 0
             self._frame_counter += 1
 
+            if not self._logged_actual_size:
+                self._logged_actual_size = True
+                self._check_actual_resolution(frame)
+
             with self._lock:
                 self._latest = CapturedFrame(
                     image=frame, frame_number=self._frame_counter, captured_at=time.time(),
                 )
+
+    def _check_actual_resolution(self, frame: np.ndarray) -> None:
+        """cv2.VideoCapture.set(CAP_PROP_FRAME_WIDTH/HEIGHT) is a no-op for RTSP sources under the
+        FFmpeg backend - the camera decides the resolution, not this config. Log what actually came
+        back so a `camera.frame_width/height` that no longer matches the stream (a lower-quality
+        profile, a changed camera setting) shows up immediately instead of silently degrading
+        detection and the images that get stored."""
+        actual_h, actual_w = frame.shape[:2]
+        if (actual_w, actual_h) != (self.frame_width, self.frame_height):
+            log.warning(
+                "[camera] stream is actually %dx%d but config.yaml says camera.frame_width/height is "
+                "%dx%d - update the config to match (this mismatch can also mean the camera is now "
+                "sending a lower-resolution/quality profile than before)",
+                actual_w, actual_h, self.frame_width, self.frame_height,
+            )
+        else:
+            log.info("[camera] stream resolution confirmed: %dx%d", actual_w, actual_h)
 
     def _reconnect(self) -> None:
         if self._capture is not None:

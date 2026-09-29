@@ -5,7 +5,7 @@ camera:
   frame_height: 720
   capture_buffer_size: 1
   decode_threads: 2
-  max_fps: 10
+  max_fps: 20
   reconnect_delay_seconds: 5.0
   max_reconnect_attempts: 0 # 0 = retry forever
   isapi_enabled: true
@@ -29,19 +29,20 @@ model:
   inference_threads: 2 # 0 = auto, -1 = no limit
   vehicle_imgsz: [512, 896] # [height, width] - must match vehicle.onnx's static shape
   plate_imgsz: 640 # must match platenum_closeup.onnx's static shape
-  vehicle_conf_threshold: 0.35
+  vehicle_conf_threshold: 0.40
   plate_conf_threshold: 0.35
   vehicle_classes: null # e.g. "car,truck,bus,motorcycle"; null = accept all
   agnostic_nms: true # one box per vehicle even when the model flips between classes
 
 tracking:
   dedup_cooldown_seconds: 2.0
-  detector_conf_floor: 0.10 # lets ByteTrack keep tracks alive; boxes under vehicle_conf_threshold are still dropped, 0 = off
+  detector_conf_floor: 0.20 # low-conf boxes are loose/oversized; 0.2 still keeps tracks alive
   plate_dedup_seconds: 30 # the same plate text is saved once per this window, 0 = off
   max_plate_attempts: 4
   plate_retry_interval_seconds: 0.4
   plate_stale_finalize_seconds: 1.5
   track_ttl_seconds: 30
+  plate_worker_max_queue: 12 # background plate-detection queue depth
 
 crop:
   plate_min_crop_height: 160
@@ -85,6 +86,7 @@ features:
   fallback_tracker: true
   position_dedup: true
   plate_detection: true
+  async_plate_detection: true # run the plate model off the frame-reading thread (see CHANGES.md)
   enhance_before_plate_detect: true
   enhance_plate_crop: true
   ocr_read: true
@@ -134,7 +136,7 @@ live:
   camera_id: "cam1"
   serve_host: "0.0.0.0"
   serve_port: 8090
-  stream_fps: 10
+  stream_fps: 20
   stream_width: 960
   jpeg_quality: 70
   box_max_age_seconds: 3

@@ -14,8 +14,15 @@ log = logging.getLogger("pipeline")
 # ByteTrack reports its own smoothed (Kalman) box. When a track gets matched to a wrong / merged
 # detection that box can suddenly become huge (or tiny) for a single update. A real vehicle only
 # changes size gradually, so the size of each track may change by at most this factor per update.
-MAX_SIZE_STEP = 1.35        # width/height may grow at most 35 % (or shrink to 1/1.35) per update
-SIZE_MEMORY_SECONDS = 1.5   # a track not seen for this long starts fresh (no clamping)
+MAX_SIZE_STEP = 1.35        # width/height may grow at most 35 % per update
+MAX_SHRINK_STEP = 2.0       # ...but may SHRINK faster: an oversized first box must settle quickly
+# ByteTrack (config/bytetrack_custom.yaml: track_buffer) keeps a lost track alive internally for up
+# to `track_buffer` frames before dropping it, and a re-matched track keeps its v-number. This must
+# stay >= track_buffer / camera.max_fps, or a track that reappears after a longer-than-that gap skips
+# the clamp entirely ("starts fresh") right when it's most likely to reappear with a bad size (its
+# Kalman box was coasting, uncorrected, the whole time it was lost). 30 frames / 10 fps = 3s; kept
+# with margin.
+SIZE_MEMORY_SECONDS = 4.0
 SIZE_PRUNE_SECONDS = 30.0
 MAX_FRAME_FRACTION = 0.80   # a box wider/taller than this share of the frame is never a single vehicle
 
@@ -23,7 +30,7 @@ MAX_FRAME_FRACTION = 0.80   # a box wider/taller than this share of the frame is
 # Stock ByteTrack trusts its constant-velocity model much more than the newest detection, so the
 # reported box trails a moving vehicle. A larger velocity noise makes it follow the detector faster
 # (stock is 1/160). Set to None to leave ultralytics untouched.
-KALMAN_VELOCITY_WEIGHT: Optional[float] = 1.0 / 50
+KALMAN_VELOCITY_WEIGHT: Optional[float] = 1.0 / 25
 
 
 def tune_tracker_kalman(velocity_weight: Optional[float] = KALMAN_VELOCITY_WEIGHT) -> bool:
@@ -78,8 +85,8 @@ class BoxStabilizer:
         previous = self._last.get(track_id)
         if previous is not None and now - previous[2] <= self.memory_seconds:
             prev_w, prev_h = previous[0], previous[1]
-            new_w = min(max(width, prev_w / self.max_step), prev_w * self.max_step)
-            new_h = min(max(height, prev_h / self.max_step), prev_h * self.max_step)
+            new_w = min(max(width, prev_w / MAX_SHRINK_STEP), prev_w * self.max_step)
+            new_h = min(max(height, prev_h / MAX_SHRINK_STEP), prev_h * self.max_step)
             if new_w != width or new_h != height:
                 log.debug("[detector] %s size %.0fx%.0f -> %.0fx%.0f (was %.0fx%.0f)",
                           track_id, width, height, new_w, new_h, prev_w, prev_h)

@@ -12,6 +12,7 @@ from detection import image_ops
 from config.config import PipelineConfig
 from detection.geometry import (
     crop_vehicle, crop_plate, is_inside_roi, compute_detect_region, box_edges, polygon_bounds,
+    point_in_polygon,
 )
 from storage.storage import DetectionStorage, DetectionRecord
 from pipeline.timing import VehicleTiming, Stopwatch
@@ -21,6 +22,7 @@ from ocr import build_ocr_reader
 from live.box_publisher import LiveBoxPublisher
 from live.live_server import LiveServer
 from pipeline.finalize_worker import FinalizeWorkerPool, FinalizeJob
+from pipeline.plate_worker import PlateDetectionWorker
 
 log = logging.getLogger("pipeline")
 
@@ -74,6 +76,14 @@ class DetectionPipeline:
         self.plate_model = detector.load_model(config.model.plate_weights, config.model.device)
         self._sync_imgsz_with_model("vehicle", config.model.vehicle_weights, "vehicle_imgsz")
         self._sync_imgsz_with_model("plate", config.model.plate_weights, "plate_imgsz")
+
+        self.plate_worker: Optional[PlateDetectionWorker] = None
+        if config.features.plate_detection and config.features.async_plate_detection:
+            self.plate_worker = PlateDetectionWorker(
+                self.plate_model, config.model.plate_conf_threshold, config.model.vehicle_iou_threshold,
+                config.model.plate_imgsz, config.features.enhance_before_plate_detect,
+                max_queue=config.tracking.plate_worker_max_queue,
+            ).start()
 
         self.fallback_tracker = FallbackTracker(
             iou_threshold=config.tracking.iou_threshold,
@@ -548,6 +558,8 @@ class DetectionPipeline:
             self.live_server.stop()
         if self.finalize_pool is not None:
             self.finalize_pool.stop()
+        if self.plate_worker is not None:
+            self.plate_worker.stop()
 
     def process_frame(self, frame: np.ndarray, always_finalize: bool = False, captured_at: Optional[float] = None) -> int:
         frame_shape = frame.shape[:2]
@@ -575,6 +587,8 @@ class DetectionPipeline:
 
             if state.finalized or state.attempts >= max_attempts:
                 continue
+            if self.plate_worker is not None and not always_finalize and self.plate_worker.is_pending(track_id):
+                continue  # previous attempt for this vehicle is still being processed in the background
 
             if state.attempts > 0:
                 if now - state.last_attempt < self.config.tracking.plate_retry_interval_seconds:
@@ -586,7 +600,16 @@ class DetectionPipeline:
             state.last_attempt = now
             track_ids_needing_plate.append(track_id)
 
-        in_roi_ids = {id(p) for p in vehicle_predictions}
+        # LIVE VIEW ONLY: show every vehicle whose centre is inside the ROI polygon. The strict
+        # filter above (size ratios, frame-edge margin) still decides which vehicles get their
+        # plate read, but it must not make a vehicle inside the ROI look "undetected" on screen.
+        with self._roi_lock:
+            live_polygon = self.config.roi.polygon
+        frame_h, frame_w = frame_shape[:2]
+        in_roi_ids = {
+            id(p) for p in all_tracked_vehicles
+            if point_in_polygon(p["x"] / frame_w, p["y"] / frame_h, live_polygon)
+        }
         for live_sink in (self.live_publisher, self.live_server):
             if live_sink is not None:
                 live_sink.publish(frame_shape, all_tracked_vehicles, in_roi_ids, captured_at)
@@ -594,6 +617,31 @@ class DetectionPipeline:
         if not features.plate_detection:
             for track_id in track_ids_needing_plate:
                 self._finalize_vehicle(track_id, self._tracks[track_id])
+        elif self.plate_worker is not None and not always_finalize:
+            for track_id in track_ids_needing_plate:
+                state = self._tracks[track_id]
+                self.plate_worker.submit(track_id, state.crop, state.attempts + 1)
+                # not submitted (backlog / already pending): state.last_attempt is already set above,
+                # so this vehicle is simply retried at the next normal retry interval - no attempt
+                # is consumed until a PlateResult actually comes back for it
+
+            for result in self.plate_worker.poll_results():
+                state = self._tracks.get(result.track_id)
+                if state is None or state.finalized:
+                    continue
+                state.attempts += 1
+                state.timing.plate_detect_ms = result.detect_ms
+                attempts_exhausted = state.attempts >= max_attempts
+
+                if result.predictions:
+                    candidate = self._evaluate_plate(state, result.predictions)
+                    if candidate is not None and (state.best is None or candidate.rank > state.best.rank):
+                        state.best = candidate
+
+                if self._is_good_enough(state.best) or attempts_exhausted:
+                    self._finalize_vehicle(result.track_id, state)
+
+            self._flush_stale_pending(now)
         else:
             plate_results = self._run_plate_detection(track_ids_needing_plate)
 

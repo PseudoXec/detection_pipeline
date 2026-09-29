@@ -71,3 +71,23 @@ Behaviour changes to be aware of:
 | Unused code | Removed `compute_containment()` and its unused config fields (`plate_containment_threshold`, `plate_min_iou`) - leftover from an earlier plate-to-vehicle matching approach that was replaced and never wired in. Also removed the never-called `queue_depth()` getter, the never-called `as_dict()` config method (and its now-unused `asdict` import), and one unused `typing.List` import | `detection/geometry.py`, `config/config.py`, `pipeline/finalize_worker.py` |
 
 No behaviour change - none of the above were reachable from the running pipeline.
+
+## Box lag / oversized box pass
+
+| Area | Change | Files |
+|---|---|---|
+| Flow seeding | Seeds only on pixels that moved between two frames (fixed camera) and on the inner ~60% of big boxes, so road/background no longer stalls the box | `live/box_flow.py` |
+| Flow tracking | Follows the moving point cluster only; 640px work width, 31px window, 4 pyramid levels, up to 2 box-sizes per step | `live/box_flow.py` |
+| Extrapolation | Blend 0.4s -> 0.15s, less velocity damping, lead up to 1.2s / 1 box size (was 0.8s / half a box) | `live/live_server.py` |
+| Size gate | Boxes may now SHRINK up to 2x per update (grow stays 1.35x) so an oversized first box settles fast | `detection/detector.py` |
+| Tracker | Kalman velocity weight 1/50 -> 1/25; new_track_thresh 0.40, track_low_thresh 0.15, match_thresh 0.8 | `detection/detector.py`, `config/bytetrack_custom.yaml` |
+| Thresholds | vehicle_conf 0.35 -> 0.40, detector_conf_floor 0.10 -> 0.20, NMS IoU 0.45 -> 0.40 (low-conf boxes are the loose, oversized ones) | `config/config.yaml`, `config/config.py` |
+
+## Receding-vehicle pass (boxes racing ahead of / stalling behind vehicles going away)
+
+| Area | Change | Files |
+|---|---|---|
+| Extrapolation | Damped projection (speed decays, tau 0.35s) instead of straight v*t; cap 0.6 box; velocity smoothing 0.65/0.35 | `live/live_server.py` |
+| Flow speed guard | An abrupt speed jump between steps is blended with the previous velocity | `live/box_flow.py` |
+| Flow re-seed | Re-seeds on pixels that moved, not on the stationary box interior (cause of stalls) | `live/box_flow.py` |
+| Moving cluster | Stricter selection (80th pct > 2px, keep points >= 50% of it) | `live/box_flow.py` |

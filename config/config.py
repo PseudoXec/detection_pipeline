@@ -43,10 +43,10 @@ class RoiConfig:
     ])
 
     crop_margin: float = 0.05
-    edge_margin_ratio: float = 0.015
+    edge_margin_ratio: float = 0.005
 
-    min_width_ratio: float = 0.025
-    min_height_ratio: float = 0.04
+    min_width_ratio: float = 0.012
+    min_height_ratio: float = 0.02
     max_width_ratio: float = 0.85
     max_height_ratio: float = 0.90
 
@@ -64,7 +64,7 @@ class ModelConfig:
     plate_imgsz: int = 640
 
     vehicle_conf_threshold: float = 0.35
-    vehicle_iou_threshold: float = 0.45
+    vehicle_iou_threshold: float = 0.40
     plate_conf_threshold: float = 0.35
 
     vehicle_classes: Optional[str] = None
@@ -89,6 +89,7 @@ class TrackingConfig:
     plate_stale_finalize_seconds: float = 1.5
 
     track_ttl_seconds: float = 30.0
+    plate_worker_max_queue: int = 12  # background plate-detection queue depth, see async_plate_detection
 
 
 @dataclass
@@ -189,6 +190,8 @@ class FeaturesConfig:
     fallback_tracker: bool = True
     position_dedup: bool = True
     plate_detection: bool = True
+    async_plate_detection: bool = True  # run the plate model on a background thread instead of
+                                        # blocking the frame loop - see pipeline/plate_worker.py
     enhance_before_plate_detect: bool = True
     enhance_plate_crop: bool = True
     ocr_read: bool = True

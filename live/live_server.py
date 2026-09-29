@@ -18,15 +18,16 @@ from live.snapshot import build_snapshot
 log = logging.getLogger("pipeline")
 
 _BOUNDARY = "frame"
-_GREEN = (0, 200, 0)
+_GREEN = (0, 0, 255)
 _GREY = (140, 140, 140)  # vehicles outside the ROI (only drawn when asked for)
 _LINE_THICKNESS = 1
 _FONT_SCALE = 0.4
-_BLEND_SECONDS = 0.4
-_MAX_EXTRAPOLATE_SECONDS = 0.8   # never project a box further ahead than this, however old the detection
-_MIN_MOTION_INTERVAL = 0.08     # detections closer together than this give noisy velocities
-_ROI_COLOR = (0, 200, 255)
-_ROI_THICKNESS = 2
+_BLEND_SECONDS = 0.15          # was 0.4 - a long blend IS visible lag on fast vehicles
+_MAX_EXTRAPOLATE_SECONDS = 1.2   # never project a box further ahead than this, however old the detection
+_EXTRAPOLATE_TAU = 0.35          # seconds; projection speed decays with this constant
+_MIN_MOTION_INTERVAL = 0.05     # detections closer together than this give noisy velocities
+_ROI_COLOR = (0, 255, 255)
+_ROI_THICKNESS = 1
 
 _VIEWER_HTML = """<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -183,7 +184,7 @@ class LiveServer:
                     vx, vy = (cx - old[0]) / elapsed, (cy - old[1]) / elapsed
                     earlier = self._motion_velocity.get(track_id)
                     if earlier is not None:  # blend with the last estimate so one noisy frame can't fling the box
-                        vx, vy = 0.6 * vx + 0.4 * earlier[0], 0.6 * vy + 0.4 * earlier[1]
+                        vx, vy = 0.65 * vx + 0.35 * earlier[0], 0.65 * vy + 0.35 * earlier[1]
                     # a vehicle can't plausibly cross more than ~3 of its own sizes per second
                     vx = max(-3.0 * max(w, 1.0), min(3.0 * max(w, 1.0), vx))
                     vy = max(-3.0 * max(h, 1.0), min(3.0 * max(h, 1.0), vy))
@@ -207,9 +208,12 @@ class LiveServer:
                 moved_vehicles.append(v)
                 continue
             width, height = v["x2"] - v["x1"], v["y2"] - v["y1"]
-            # same shift for both edges -> the box keeps its size; never move it more than half its own size
-            dx = max(-0.5 * width, min(0.5 * width, velocity[0] * ahead))
-            dy = max(-0.5 * height, min(0.5 * height, velocity[1] * ahead))
+            # same shift for both edges -> the box keeps its size; never move it more than its own size
+            # damped projection: speed decays with time constant tau (vehicles receding from the
+            # camera decelerate in image space) - a straight v*t line overshoots them
+            reach = _EXTRAPOLATE_TAU * (1.0 - math.exp(-ahead / _EXTRAPOLATE_TAU))
+            dx = max(-0.6 * width, min(0.6 * width, velocity[0] * reach))
+            dy = max(-0.6 * height, min(0.6 * height, velocity[1] * reach))
             moved_vehicles.append(dict(v, x1=v["x1"] + dx, y1=v["y1"] + dy, x2=v["x2"] + dx, y2=v["y2"] + dy))
         return moved_vehicles
 
