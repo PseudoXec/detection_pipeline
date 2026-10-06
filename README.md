@@ -194,7 +194,7 @@ var status = await http.GetFromJsonAsync<JsonElement>("/control/mode");   // pol
 ## 5. The SQLite buffer
 
 Opened in WAL mode, so the C# side can read while the Pi writes. Vehicle rows are in `detections`
-(unchanged, see below); person rows are in `person_detections`. `synced`: `0` waiting, `1` delivered (or
+(unchanged, see below); person rows are in `person_detections` (an older, wider `person_detections` table must be deleted once: run `python storage/reset_buffer.py`, or delete `data/pipeline_buffer.db`). `synced`: `0` waiting, `1` delivered (or
 nothing to deliver), `2` the API said this event is unacceptable (kept for inspection, never retried).
 
 ### `detections` (vehicle mode) - unchanged
@@ -209,16 +209,13 @@ is created next to it automatically, no `storage/reset_buffer.py` needed.
 |---|---|
 | `event_uuid` | unique id of the event (idempotency key for the API) |
 | `device_id`, `session_id` | which Pi, which program run (track ids restart every run) |
-| `track_id`, `track_first_seen_at`, `track_last_seen_at` | tracker id (`p12`) and how long the person was in view |
-| `camera_source`, `camera_name`, `camera_ip`, `camera_location`, `frame_width`, `frame_height` | where it came from; the frame size the boxes refer to |
-| `person_confidence`, `person_image`, `person_box_x1..y2` | person crop (JPEG); box in **full-frame** pixels |
+| `track_id` | tracker id (`p12`) |
+| `camera_name`, `camera_ip`, `camera_location` | where it came from |
+| `person_confidence`, `person_image` | person crop (JPEG) |
 | `face_detected` | 0 or 1 |
-| `face_confidence`, `face_image`, `face_box_x1..y2`, `face_landmarks` | face crop (JPEG, with margin); box and the 5 landmarks (JSON `[[x,y]x5]`) in pixels **inside `person_image`** |
-| `face_sharpness`, `face_quality_score`, `face_attempts` | quality of the stored face; how many face tries the track used |
-| `image_format` | `jpeg` |
+| `face_image`, `face_landmarks` | face crop (JPEG, with margin); the 5 landmarks (JSON `[[x,y]x5]`) in pixels **inside `person_image`** |
+| `face_quality_score` | quality of the stored face |
 | `detected_at` | local time `YYYY-MM-DD HH:MM:SS`, same format as `detections` |
-| `person_detect_ms`, `person_crop_ms`, `face_detect_ms`, `face_crop_ms`, `total_pipeline_ms` | timings; `total` = frame grabbed -> row built |
-| `pipeline_version`, `person_model`, `face_model`, `cpu_temp_c` | what produced it, and the Pi's temperature (watch for throttling) |
 | `synced`, `sync_attempts`, `last_sync_attempt_at`, `synced_at`, `sync_error` | delivery bookkeeping |
 | `created_at` | row insert time |
 
@@ -255,7 +252,7 @@ was found, `FaceImage` as files. **The full field list, coordinate conventions, 
 `docs/person-api-contract.md`: that is the file to give the command-center team.**
 
 * `EventId` is the idempotency key. The endpoint must ignore an `EventId` it already stored; 409 counts as delivered.
-* The camera password is removed from `CameraSource` before anything is stored in the person table or sent.
+* The camera source is stored locally (login removed) and is not sent to the command center.
 * Only answers that are about *this* event (400, 413, 415, 422) park it (`synced = 2`). Server trouble, a wrong URL
   or token (404, 401, 403, 5xx, 429, no connection) keep it queued and retried with a growing wait (up to an hour
   per event), so an outage of any length loses nothing and fixing the setup releases the backlog.

@@ -23,7 +23,6 @@ import numpy as np
 from core import detector, image_ops
 from core.finalize_worker import FinalizeJob, FinalizeWorkerPool
 from core.geometry import box_edges, crop_box, point_in_polygon
-from core.urls import redact_credentials
 from core.tracker import FallbackTracker, PositionDeduper, needs_fallback_tracker
 from modes.base import DetectionMode, RuntimeContext
 from modes.person.face import FaceDetectionWorker, FaceHit, FaceResult, YuNetFaceDetector
@@ -425,10 +424,9 @@ class PersonMode(DetectionMode):
             if disk is not None:
                 disk[f"face_detection/{stem}_face.jpg"] = face_jpeg
             face_fields = dict(
-                face_confidence=hit.score, face_image_jpeg=face_jpeg,
-                face_box_x1=fx1, face_box_y1=fy1, face_box_x2=fx2, face_box_y2=fy2,
+                face_image_jpeg=face_jpeg,
                 face_landmarks=json.dumps([[round(x, 1), round(y, 1)] for x, y in hit.landmarks]),
-                face_sharpness=round(hit.sharpness, 2), face_quality_score=round(hit.quality, 4),
+                face_quality_score=round(hit.quality, 4),
             )
 
         if sighting.captured_at is not None:
@@ -436,21 +434,11 @@ class PersonMode(DetectionMode):
         else:
             total_ms = round(sum(v for v in (sighting.detect_ms, person_crop_ms, face_detect_ms, face_crop_ms) if v), 2)
 
-        x1, y1, x2, y2 = sighting.box
-        frame_h, frame_w = sighting.frame_shape
         record = PersonRecord(
             event_uuid=event_uuid, device_id=config.runtime.device_id or "unknown", session_id=self.ctx.session_id,
-            track_id=track_id, camera_source=redact_credentials(self.camera_source),
+            track_id=track_id,
             person_confidence=sighting.confidence, person_image_jpeg=person_jpeg,
-            person_box_x1=x1, person_box_y1=y1, person_box_x2=x2, person_box_y2=y2,
             face_detected=face is not None, detected_at=detected_at,
-            track_first_seen_at=first_seen, track_last_seen_at=last_seen,
-            frame_width=frame_w, frame_height=frame_h,
-            face_attempts=attempts,
-            person_detect_ms=sighting.detect_ms, person_crop_ms=person_crop_ms,
-            face_detect_ms=face_detect_ms, face_crop_ms=face_crop_ms, total_pipeline_ms=total_ms,
-            pipeline_version=PIPELINE_VERSION, person_model=self._person_model_name,
-            face_model=self._face_model_name, cpu_temp_c=_cpu_temp_c(),
             disk_files=disk, **face_fields,
         )
         print(f"[person] {track_id} stored - face {'found (q=%.2f)' % face.hit.quality if face else 'not found'}"

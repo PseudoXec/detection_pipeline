@@ -18,7 +18,6 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 import requests
 
 from api.result import SendResult
-from core.urls import redact_credentials
 
 if TYPE_CHECKING:
     from modes.person.store import PersonRecord
@@ -53,33 +52,15 @@ def build_form(
         "CameraName": camera_name,
         "CameraIpAddress": camera_ip,
         "CameraLocation": camera_location,
-        "CameraSource": redact_credentials(record.camera_source),     # never send the camera password
 
         # the Pi's local wall-clock time, with its UTC offset so the server can convert it unambiguously
         "DetectedAt": record.detected_at.astimezone().isoformat(timespec="seconds"),
-        "FrameWidth": None if record.frame_width is None else str(record.frame_width),
-        "FrameHeight": None if record.frame_height is None else str(record.frame_height),
 
         "PersonConfidence": _number(record.person_confidence, 4),
-        "PersonBoxX1": _number(record.person_box_x1, 1),
-        "PersonBoxY1": _number(record.person_box_y1, 1),
-        "PersonBoxX2": _number(record.person_box_x2, 1),
-        "PersonBoxY2": _number(record.person_box_y2, 1),
 
         "FaceDetected": "true" if record.face_detected else "false",
-        "FaceConfidence": _number(record.face_confidence, 4),
-        "FaceBoxX1": _number(record.face_box_x1, 1),
-        "FaceBoxY1": _number(record.face_box_y1, 1),
-        "FaceBoxX2": _number(record.face_box_x2, 1),
-        "FaceBoxY2": _number(record.face_box_y2, 1),
-        "FaceLandmarks": record.face_landmarks,                        # JSON text: [[x, y] x 5]
+        "FaceLandmarks": record.face_landmarks,                        # JSON text: [[x, y] x 5], pixels of PersonImage
         "FaceQualityScore": _number(record.face_quality_score, 4),
-
-        "PersonDetectMs": _number(record.person_detect_ms, 2),
-        "PersonCropMs": _number(record.person_crop_ms, 2),
-        "FaceDetectMs": _number(record.face_detect_ms, 2),
-        "FaceCropMs": _number(record.face_crop_ms, 2),
-        "TotalPipelineMs": _number(record.total_pipeline_ms, 2),
     }
     return {key: value for key, value in fields.items() if value not in (None, "")}
 

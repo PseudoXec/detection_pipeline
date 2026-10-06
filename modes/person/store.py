@@ -1,13 +1,11 @@
 """SQLite buffer for the person mode: table `person_detections`.
 
 One row per person TRACK (not per frame): the best person crop, the best face crop when a face was
-found, and everything needed to judge or redo the work later (boxes, landmarks, quality, timings,
-model versions). The sync part sends rows to the dashboard API and records how that went.
+found, and only what the command center needs (landmarks, face quality). The sync part sends rows to
+the dashboard API and records how that went.
 
 Coordinates:
-* person_box_*       pixels in the FULL camera frame (frame_width x frame_height).
-* face_box_*, face_landmarks   pixels inside the stored PERSON crop (person_image) - the same
-  convention the vehicle table uses for plate boxes, so a viewer can draw them straight onto the image.
+* face_landmarks     pixels inside the stored PERSON crop (person_image).
 
 Times are local wall-clock text "YYYY-MM-DD HH:MM:SS" like the vehicle table, so retention and the
 dashboard treat both tables the same way.
@@ -35,39 +33,13 @@ class PersonRecord:
     device_id: str
     session_id: str
     track_id: str
-    camera_source: str
     person_confidence: float
     person_image_jpeg: bytes
-    person_box_x1: float
-    person_box_y1: float
-    person_box_x2: float
-    person_box_y2: float
     face_detected: bool
     detected_at: datetime
-    track_first_seen_at: Optional[datetime] = None
-    track_last_seen_at: Optional[datetime] = None
-    frame_width: Optional[int] = None
-    frame_height: Optional[int] = None
-    face_confidence: Optional[float] = None
     face_image_jpeg: Optional[bytes] = None
-    face_box_x1: Optional[float] = None
-    face_box_y1: Optional[float] = None
-    face_box_x2: Optional[float] = None
-    face_box_y2: Optional[float] = None
     face_landmarks: Optional[str] = None          # JSON: [[x, y] x 5], pixels inside person_image
-    face_sharpness: Optional[float] = None
     face_quality_score: Optional[float] = None
-    face_attempts: Optional[int] = None
-    image_format: str = "jpeg"
-    person_detect_ms: Optional[float] = None
-    person_crop_ms: Optional[float] = None
-    face_detect_ms: Optional[float] = None
-    face_crop_ms: Optional[float] = None
-    total_pipeline_ms: Optional[float] = None
-    pipeline_version: Optional[str] = None
-    person_model: Optional[str] = None
-    face_model: Optional[str] = None
-    cpu_temp_c: Optional[float] = None
     disk_files: Optional[Dict[str, bytes]] = None
 
 
@@ -78,47 +50,20 @@ CREATE TABLE IF NOT EXISTS person_detections (
     device_id            TEXT NOT NULL,
     session_id           TEXT NOT NULL,
     track_id             TEXT NOT NULL,
-    track_first_seen_at  TEXT,
-    track_last_seen_at   TEXT,
 
-    camera_source        TEXT NOT NULL,
     camera_name          TEXT,
     camera_ip            TEXT,
     camera_location      TEXT,
-    frame_width          INTEGER,
-    frame_height         INTEGER,
 
     person_confidence    REAL NOT NULL,
     person_image         BLOB NOT NULL,
-    person_box_x1        REAL NOT NULL,
-    person_box_y1        REAL NOT NULL,
-    person_box_x2        REAL NOT NULL,
-    person_box_y2        REAL NOT NULL,
 
     face_detected        INTEGER NOT NULL CHECK (face_detected IN (0, 1)),
-    face_confidence      REAL,
     face_image           BLOB,
-    face_box_x1          REAL,
-    face_box_y1          REAL,
-    face_box_x2          REAL,
-    face_box_y2          REAL,
     face_landmarks       TEXT,
-    face_sharpness       REAL,
     face_quality_score   REAL,
-    face_attempts        INTEGER,
-    image_format         TEXT NOT NULL DEFAULT 'jpeg',
 
     detected_at          TEXT NOT NULL,
-    person_detect_ms     REAL,
-    person_crop_ms       REAL,
-    face_detect_ms       REAL,
-    face_crop_ms         REAL,
-    total_pipeline_ms    REAL,
-
-    pipeline_version     TEXT,
-    person_model         TEXT,
-    face_model           TEXT,
-    cpu_temp_c           REAL,
 
     synced               INTEGER NOT NULL DEFAULT 0,
     sync_attempts        INTEGER NOT NULL DEFAULT 0,
@@ -185,30 +130,19 @@ class PersonStorage(BufferedStore):
                 cursor.execute(
                     """
                     INSERT INTO person_detections (
-                        event_uuid, device_id, session_id, track_id, track_first_seen_at, track_last_seen_at,
-                        camera_source, camera_name, camera_ip, camera_location, frame_width, frame_height,
+                        event_uuid, device_id, session_id, track_id,
+                        camera_name, camera_ip, camera_location,
                         person_confidence, person_image,
-                        person_box_x1, person_box_y1, person_box_x2, person_box_y2,
-                        face_detected, face_confidence, face_image,
-                        face_box_x1, face_box_y1, face_box_x2, face_box_y2,
-                        face_landmarks, face_sharpness, face_quality_score, face_attempts, image_format,
-                        detected_at, person_detect_ms, person_crop_ms, face_detect_ms, face_crop_ms, total_pipeline_ms,
-                        pipeline_version, person_model, face_model, cpu_temp_c
-                    ) VALUES (?,?,?,?,?,?, ?,?,?,?,?,?, ?,?, ?,?,?,?, ?,?,?, ?,?,?,?, ?,?,?,?,?, ?,?,?,?,?,?, ?,?,?,?)
+                        face_detected, face_image, face_landmarks, face_quality_score,
+                        detected_at
+                    ) VALUES (?,?,?,?, ?,?,?, ?,?, ?,?,?,?, ?)
                     """,
                     (
                         r.event_uuid, r.device_id, r.session_id, r.track_id,
-                        _ts(r.track_first_seen_at), _ts(r.track_last_seen_at),
-                        r.camera_source, self.camera_name, self.camera_ip, self.camera_location,
-                        r.frame_width, r.frame_height,
+                        self.camera_name, self.camera_ip, self.camera_location,
                         r.person_confidence, r.person_image_jpeg,
-                        r.person_box_x1, r.person_box_y1, r.person_box_x2, r.person_box_y2,
-                        1 if r.face_detected else 0, r.face_confidence, r.face_image_jpeg,
-                        r.face_box_x1, r.face_box_y1, r.face_box_x2, r.face_box_y2,
-                        r.face_landmarks, r.face_sharpness, r.face_quality_score, r.face_attempts, r.image_format,
-                        _ts(r.detected_at), r.person_detect_ms, r.person_crop_ms, r.face_detect_ms, r.face_crop_ms,
-                        r.total_pipeline_ms,
-                        r.pipeline_version, r.person_model, r.face_model, r.cpu_temp_c,
+                        1 if r.face_detected else 0, r.face_image_jpeg, r.face_landmarks, r.face_quality_score,
+                        _ts(r.detected_at),
                     ),
                 )
                 ids.append(cursor.lastrowid)
@@ -284,22 +218,9 @@ class PersonStorage(BufferedStore):
             return datetime.fromisoformat(value) if value else None
         return PersonRecord(
             event_uuid=row["event_uuid"], device_id=row["device_id"], session_id=row["session_id"],
-            track_id=row["track_id"], camera_source=row["camera_source"],
+            track_id=row["track_id"],
             person_confidence=row["person_confidence"], person_image_jpeg=row["person_image"],
-            person_box_x1=row["person_box_x1"], person_box_y1=row["person_box_y1"],
-            person_box_x2=row["person_box_x2"], person_box_y2=row["person_box_y2"],
             face_detected=bool(row["face_detected"]), detected_at=when(row["detected_at"]),
-            track_first_seen_at=when(row["track_first_seen_at"]), track_last_seen_at=when(row["track_last_seen_at"]),
-            frame_width=row["frame_width"], frame_height=row["frame_height"],
-            face_confidence=row["face_confidence"], face_image_jpeg=row["face_image"],
-            face_box_x1=row["face_box_x1"], face_box_y1=row["face_box_y1"],
-            face_box_x2=row["face_box_x2"], face_box_y2=row["face_box_y2"],
-            face_landmarks=row["face_landmarks"], face_sharpness=row["face_sharpness"],
-            face_quality_score=row["face_quality_score"], face_attempts=row["face_attempts"],
-            image_format=row["image_format"],
-            person_detect_ms=row["person_detect_ms"], person_crop_ms=row["person_crop_ms"],
-            face_detect_ms=row["face_detect_ms"], face_crop_ms=row["face_crop_ms"],
-            total_pipeline_ms=row["total_pipeline_ms"],
-            pipeline_version=row["pipeline_version"], person_model=row["person_model"],
-            face_model=row["face_model"], cpu_temp_c=row["cpu_temp_c"],
+            face_image_jpeg=row["face_image"], face_landmarks=row["face_landmarks"],
+            face_quality_score=row["face_quality_score"],
         )
