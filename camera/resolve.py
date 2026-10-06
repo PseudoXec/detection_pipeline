@@ -2,6 +2,7 @@
 import logging
 
 from api.camera_source_client import fetch_camera_source
+from camera.identity import get_identity
 from camera.isapi_client import CameraDeviceInfo, extract_credentials, extract_host, fetch_device_info
 from config.config import PipelineConfig
 
@@ -43,12 +44,15 @@ def resolve_camera_info(config: PipelineConfig):
     if not username:
         username, password = extract_credentials(rtsp_url)
 
-    return fetch_device_info(
+    return get_identity(
         host,
-        port=config.camera.isapi_port,
-        username=username,
-        password=password,
-        use_https=config.camera.isapi_https,
-        timeout_seconds=config.camera.isapi_timeout_seconds,
-        channel_id=config.camera.isapi_channel_id,
+        lambda: fetch_device_info(
+            host,
+            port=config.camera.isapi_port,
+            username=username,
+            password=password,
+            use_https=config.camera.isapi_https,
+            timeout_seconds=config.camera.isapi_timeout_seconds,
+            channel_id=config.camera.isapi_channel_id,
+        ),
     )
