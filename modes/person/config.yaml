@@ -1,0 +1,35 @@
+# Person mode: person detect -> face detect -> store. Everything here is used by person mode only.
+# Relative paths are relative to this folder (modes/person/). Machine-specific overrides: config.local.yaml.
+
+weights: "models/person_ncnn_model" # export your person model with tools/export_ncnn.py
+face_weights: "models/face_detection_yunet_2023mar.onnx" # from the OpenCV Zoo, see models/README.md
+imgsz: 416
+conf_threshold: 0.40
+detector_conf_floor: 0.20
+classes: null # e.g. "person" if your model has several classes; null = accept all
+
+bytetrack_config: "bytetrack.yaml"
+
+roi_filter: true # a person is "inside" when their FEET (bottom-centre of the box) are in the polygon
+roi_crop_detect: false # true = run the model only on the ROI window (faster, but people outside it are not seen)
+roi_crop_margin: 0.05
+roi_top_extra: 0.30 # that window also grows this far above the polygon, because people are tall
+
+jpeg_quality: 90
+face_jpeg_quality: 95
+
+face_enabled: true # false = store people without looking for faces (no face model needed)
+async_face_detection: true # face model on its own thread, off the frame loop
+face_score_threshold: 0.7
+face_search_region: [0.0, 0.0, 1.0, 0.6] # where in the person box to look for a face: top 60%
+face_min_px: 40 # a face smaller than this (smaller side, px) is ignored
+face_min_sharpness: 40.0 # blurrier than this (Laplacian variance) is ignored
+face_good_enough_quality: 0.6 # store the row as soon as a face scores this well
+face_max_attempts: 12 # after this many face tries the person is stored (without a face if none was good)
+face_retry_interval_seconds: 0.3
+
+stale_finalize_seconds: 1.5 # person left the zone -> store their best sighting after this long
+save_images_to_disk: true
+store_to_sqlite: true
+send_via_api: false # needs api.person_endpoint_url and switches.api
+send_rows_without_face: true # false = people without a usable face stay local, they are never sent

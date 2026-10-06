@@ -85,6 +85,10 @@ class LiveServer:
         box_visual_tracking: bool = True,
         roi_get: Optional[Callable[[], List[List[float]]]] = None,
         roi_set: Optional[Callable[[List[List[float]]], None]] = None,
+        mode_status: Optional[Callable[[], Dict[str, Any]]] = None,
+        mode_request: Optional[Callable[[str, str], Dict[str, Any]]] = None,
+        mode_choices: Optional[Callable[[], List[str]]] = None,
+        live_enabled: bool = True,
     ):
         self.camera_id = camera_id
         self.host = host
@@ -103,6 +107,12 @@ class LiveServer:
 
         self._roi_get = roi_get
         self._roi_set = roi_set
+        # command-center control of the detection mode (see control/mode_manager.py)
+        self._mode_status = mode_status
+        self._mode_request = mode_request
+        self._mode_choices = mode_choices
+        # False = serve only /control/* and /live/health; the camera image/boxes stay private
+        self.live_enabled = live_enabled
 
         self._frame_source: Optional[Callable[[], Any]] = None
         self._snapshot: Optional[Dict[str, Any]] = None
@@ -130,10 +140,16 @@ class LiveServer:
         self._httpd.daemon_threads = True
         self._thread = threading.Thread(target=self._httpd.serve_forever, name="live-server", daemon=True)
         self._thread.start()
-        log.info("[live] serving %s at http://%s:%d/live/stream.mjpg (also /live/view, /live/frame.jpg, /live/boxes, /live/roi)",
-                 self.camera_id, "<pi-ip>" if self.host in ("0.0.0.0", "") else self.host, self.port)
+        pi_host = "<pi-ip>" if self.host in ("0.0.0.0", "") else self.host
+        if self.live_enabled:
+            log.info("[live] serving %s at http://%s:%d/live/stream.mjpg (also /live/view, /live/frame.jpg, /live/boxes, /live/roi)",
+                     self.camera_id, pi_host, self.port)
+        if self._mode_request is not None:
+            log.info("[control] detection mode can be changed with POST http://%s:%d/control/mode  {\"mode\": \"vehicle|person|idle\"}",
+                     pi_host, self.port)
         if not self.auth_token:
-            log.warning("[live] live.auth_token is not set - anyone who can reach this port can watch the camera")
+            log.warning("[live] live.auth_token is not set - anyone who can reach this port can watch the camera"
+                        + (" and switch the detection mode" if self._mode_request is not None else ""))
         return self
 
     def stop(self) -> None:
@@ -144,18 +160,32 @@ class LiveServer:
         if self._thread is not None:
             self._thread.join(timeout=2.0)
 
+    def clear_boxes(self) -> None:
+        """Forget every box and motion estimate. Called when the detection mode changes so the old
+        mode's boxes can't linger on screen or be mistaken for the new mode's tracks."""
+        with self._enc_lock:
+            self._snapshot = None
+            self._motion = None
+            self._prev_boxes = None
+            self._motion_velocity = {}
+            self._shown.clear()
+            self._cache.clear()
+            if self._flow is not None:
+                self._flow = BoxFlow()
+
     def publish(
         self,
         frame_shape: tuple,
         predictions: List[Dict[str, Any]],
         in_roi_ids: Set[int],
         captured_at: Optional[float] = None,
+        mode: Optional[str] = None,
     ) -> None:
         try:
             self._seq += 1
             snapshot = build_snapshot(
                 self.camera_id, self.session_id, self._seq,
-                frame_shape, predictions, in_roi_ids, captured_at,
+                frame_shape, predictions, in_roi_ids, captured_at, mode,
             )
             if self.box_extrapolate:
                 self._motion = self._estimate_motion(snapshot)
@@ -398,7 +428,14 @@ class LiveServer:
                             "has_frame": cap is not None,
                             "frame_age_seconds": round(time.time() - cap.captured_at, 2) if cap else None,
                             "boxes_age_seconds": round(time.time() - snap["processed_at"], 2) if snap else None,
+                            "mode": server._mode_status() if server._mode_status else None,
                         })
+
+                    if url.path == "/control/mode":
+                        return self._mode_get()
+
+                    if url.path.startswith("/live/") and url.path != "/live/health" and not server.live_enabled:
+                        return self._json(404, {"error": "live view is disabled (features.live_stream is false)"})
 
                     if url.path == "/live/boxes":
                         snap = server._snapshot
@@ -437,9 +474,40 @@ class LiveServer:
                     if url.path == "/live/roi":
                         return self._set_roi()
 
+                    if url.path == "/control/mode":
+                        return self._mode_post(query)
+
                     self._json(404, {"error": "not found"})
                 except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                     pass
+
+            def _mode_get(self) -> None:
+                if server._mode_status is None:
+                    return self._json(404, {"error": "mode control is not enabled (mode.control_enabled)"})
+                return self._json(200, server._mode_status())
+
+            def _mode_post(self, query) -> None:
+                if server._mode_request is None:
+                    return self._json(404, {"error": "mode control is not enabled (mode.control_enabled)"})
+
+                requested = (query.get("mode", [""])[0] or "").strip()
+                length = int(self.headers.get("Content-Length", 0) or 0)
+                if length:
+                    try:
+                        body = json.loads(self.rfile.read(length) or b"{}")
+                        requested = str(body.get("mode", requested) if isinstance(body, dict) else requested).strip()
+                    except (json.JSONDecodeError, ValueError) as error:
+                        return self._json(400, {"error": f"bad request body: {error}"})
+
+                choices = server._mode_choices() if server._mode_choices else []
+                if not requested:
+                    return self._json(400, {"error": "send {\"mode\": \"<name>\"}", "allowed": choices})
+                if choices and requested.lower() not in choices:
+                    return self._json(400, {"error": f"unknown mode {requested!r}", "allowed": choices})
+
+                status = server._mode_request(requested.lower(), "command-center")
+                # 202: the switch happens in the background, poll GET /control/mode for the result
+                return self._json(202, status)
 
             def _set_roi(self) -> None:
                 if server._roi_set is None:

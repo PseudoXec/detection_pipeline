@@ -1,30 +1,37 @@
+"""Entry point: reads the settings, starts the services every detection mode shares, then feeds frames
+to the mode manager. Everything with a real job lives in its own folder - this file only wires them up.
+
+    python run.py                       run from the camera, in the mode the command center last chose
+    python run.py --mode person         start in a specific mode
+    python run.py --image a.jpg         one image          python run.py --folder ./imgs    a folder of images
+"""
 import argparse
 import logging
-import os
-import signal
 import sys
-import threading
-import time
+import uuid
 
 import cv2
 
-from api.camera_source_client import fetch_camera_source
-from camera.camera import ThreadedRTSPCamera, configure_decode_threads
-from camera.isapi_client import CameraDeviceInfo, extract_credentials, extract_host, fetch_device_info
+from camera.frame_loop import list_images_in_folder, run_on_images, run_on_stream
+from camera.resolve import resolve_camera_info, resolve_camera_source
+from camera.roi_manager import RoiManager
 from config.config import PipelineConfig
-from pipeline.pipeline import DetectionPipeline
-from storage.storage import DetectionStorage
-from detection import detector
+from control.mode_manager import ModeManager, choose_initial_mode
+from live.outputs import build_live_outputs
+from live.sinks import LiveSinks
+from modes.base import RuntimeContext
+from storage.hub import StorageHub
 
 log = logging.getLogger("pipeline")
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Vehicle & license plate detection pipeline")
-    parser.add_argument("--config", help="Path to a config.yaml (defaults to the one next to this file)")
-    parser.add_argument("--rtsp-url", help="Override the RTSP URL from config.yaml")
+    parser = argparse.ArgumentParser(description="Detection pipeline (vehicle / person), switchable from the command center")
+    parser.add_argument("--config", help="Optional extra config file, applied after all the config.yaml files (see config/config.py)")
+    parser.add_argument("--rtsp-url", help="Override camera.rtsp_url")
     parser.add_argument("--image", help="Process a single image instead of a live stream")
     parser.add_argument("--folder", help="Process every image in a folder instead of a live stream")
+    parser.add_argument("--mode", help="Start in this detection mode (vehicle | person | idle), overriding the saved choice and mode.default")
     return parser.parse_args()
 
 
@@ -33,169 +40,6 @@ def setup_logging(level_name: str) -> None:
         level=getattr(logging, level_name.upper(), logging.INFO),
         format="%(asctime)s [%(levelname)s] %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
-    )
-
-
-def run_on_images(pipeline: DetectionPipeline, image_paths: list) -> None:
-    for path in image_paths:
-        frame = cv2.imread(path)
-        if frame is None:
-            log.warning("could not read image: %s", path)
-            continue
-        new_vehicles = pipeline.process_frame(frame, always_finalize=True)
-        log.info("%s -> %d new vehicle(s)", path, new_vehicles)
-
-
-def run_on_stream(pipeline: DetectionPipeline, config: PipelineConfig) -> None:
-    configure_decode_threads(config.camera.decode_threads)
-
-    camera = ThreadedRTSPCamera(
-        rtsp_url=config.camera.rtsp_url,
-        frame_width=config.camera.frame_width,
-        frame_height=config.camera.frame_height,
-        buffer_size=config.camera.capture_buffer_size,
-        reconnect_delay_seconds=config.camera.reconnect_delay_seconds,
-        max_reconnect_attempts=config.camera.max_reconnect_attempts,
-        max_fps=config.camera.max_fps,
-    ).start()
-
-    if pipeline.live_server is not None:
-        pipeline.live_server.set_frame_source(camera.read_latest)
-        pipeline.live_server.start()
-
-    pipeline.warmup(frame_shape=(config.camera.frame_height, config.camera.frame_width))
-
-    stop_event = threading.Event()
-    shutdown_requests = 0
-
-    def handle_shutdown(signum, _frame):
-        nonlocal shutdown_requests
-        shutdown_requests += 1
-        if shutdown_requests == 1:
-            log.info("received signal %s - shutting down... (press Ctrl+C again to force-quit immediately)", signum)
-            stop_event.set()
-        else:
-            log.info("second interrupt received - forcing immediate exit")
-            os._exit(1)
-
-    signal.signal(signal.SIGINT, handle_shutdown)
-    signal.signal(signal.SIGTERM, handle_shutdown)
-
-    last_processed_frame_number = -1
-    frames_processed = 0
-    max_frames = config.runtime.max_frames
-    heartbeat_interval_seconds = 15.0
-    last_heartbeat = time.time()
-    last_heartbeat_frame_count = 0
-    waited_for_first_frame = False
-
-    log.info("pipeline running - press Ctrl+C to stop")
-    try:
-        while not stop_event.is_set():
-            captured = camera.read_latest()
-
-            if captured is None:
-                if not waited_for_first_frame and time.time() - last_heartbeat > 5.0:
-                    log.info("still waiting on the first frame from the camera...")
-                    last_heartbeat = time.time()
-                time.sleep(0.05)
-                continue
-            waited_for_first_frame = True
-
-            if captured.frame_number <= last_processed_frame_number:
-                time.sleep(0.01)
-                continue
-            last_processed_frame_number = captured.frame_number
-
-            pipeline.process_frame(captured.image, captured_at=captured.captured_at)
-            frames_processed += 1
-
-            if time.time() - last_heartbeat >= heartbeat_interval_seconds:
-                new_frames = frames_processed - last_heartbeat_frame_count
-                log.info(
-                    "heartbeat: %d frame(s) processed in the last %.0fs (%d total) - still running",
-                    new_frames, heartbeat_interval_seconds, frames_processed,
-                )
-                last_heartbeat = time.time()
-                last_heartbeat_frame_count = frames_processed
-
-            if config.features.show_preview:
-                cv2.imshow("pipeline preview", captured.image)
-                if cv2.waitKey(1) & 0xFF == ord("q"):
-                    break
-
-            if max_frames and frames_processed >= max_frames:
-                log.info("reached configured max_frames=%d - stopping", max_frames)
-                break
-    except KeyboardInterrupt:
-        log.info("KeyboardInterrupt caught directly - shutting down...")
-    finally:
-        camera.stop()
-        if config.features.show_preview:
-            cv2.destroyAllWindows()
-
-
-def start_retention_housekeeping(storage: DetectionStorage, retention_days: int, max_unsynced_days: int = 0) -> None:
-    if retention_days <= 0 and max_unsynced_days <= 0:
-        return
-
-    def loop():
-        while True:
-            try:
-                deleted = storage.delete_synced_older_than(retention_days)
-                unsynced = storage.delete_unsynced_older_than(max_unsynced_days)
-                files = storage.sweep_output_dir(retention_days)
-                if deleted or unsynced or files:
-                    log.info("retention cleanup: removed %d synced row(s), %d undelivered row(s), %d image file(s)",
-                             deleted, unsynced, files)
-            except Exception as error:
-                log.warning("retention cleanup failed: %s", error)
-            time.sleep(6 * 60 * 60)
-
-    threading.Thread(target=loop, name="retention", daemon=True).start()
-
-
-def resolve_camera_source(config: PipelineConfig) -> None:
-    if config.camera.source_mode != "api":
-        return
-    if config.camera.image or config.camera.folder:
-        return
-
-    source = fetch_camera_source(
-        config.api.roi_endpoint_url,
-        config.api.camera_id,
-        config.api.roi_fetch_timeout_seconds,
-    )
-    if source is None:
-        if config.camera.rtsp_url:
-            log.warning("[camera-source] falling back to the static camera.rtsp_url from config.yaml")
-        return
-
-    config.camera.rtsp_url = source.rtsp_url
-
-
-def resolve_camera_info(config: PipelineConfig):
-    rtsp_url = config.camera.rtsp_url
-    if not rtsp_url:
-        return None
-
-    host = extract_host(rtsp_url)
-    if not config.camera.isapi_enabled or not host:
-        return CameraDeviceInfo(ip_address=host)
-
-    username = config.camera.isapi_username
-    password = config.camera.isapi_password
-    if not username:
-        username, password = extract_credentials(rtsp_url)
-
-    return fetch_device_info(
-        host,
-        port=config.camera.isapi_port,
-        username=username,
-        password=password,
-        use_https=config.camera.isapi_https,
-        timeout_seconds=config.camera.isapi_timeout_seconds,
-        channel_id=config.camera.isapi_channel_id,
     )
 
 
@@ -212,8 +56,8 @@ def main() -> None:
 
     setup_logging(config.runtime.log_level)
 
-    if not config.api.enabled:
-        log.info("[api] api.enabled is false - ROI fetch, camera source fetch and data sending are off")
+    if not config.switches.api:
+        log.info("[api] switches.api is off - ROI fetch, camera source fetch and data sending are off")
 
     cv2.setNumThreads(max(1, config.runtime.opencv_threads))
 
@@ -221,45 +65,47 @@ def main() -> None:
         resolve_camera_source(config)
 
     camera_info = resolve_camera_info(config)
-
-    storage = DetectionStorage(
-        database_path=config.storage.database_path,
-        batch_size=config.storage.write_batch_size,
-        flush_interval_seconds=config.storage.write_flush_interval_seconds,
-        send_via_api=config.features.send_via_api,
-        delete_row_after_api_send=config.features.delete_row_after_api_send,
-        api_endpoint_url=config.api.endpoint_url,
-        api_timeout_seconds=config.api.timeout_seconds,
-        output_dir=config.storage.output_dir if config.features.save_images_to_disk else None,
-        delete_disk_images_after_send=config.storage.delete_disk_images_after_send,
-        send_retry_seconds=config.storage.send_retry_seconds,
-        camera_name=camera_info.name if camera_info else None,
-        camera_ip=camera_info.ip_address if camera_info else None,
-        camera_location=camera_info.location if camera_info else None,
-    ).start()
-    start_retention_housekeeping(storage, config.storage.retention_days, config.storage.max_unsynced_days)
-
     camera_source = config.camera.rtsp_url or config.camera.folder or config.camera.image or "unknown"
-    pipeline = DetectionPipeline(config, storage, camera_source)
+    initial_mode = choose_initial_mode(config, args.mode)
+
+    # ---- everything below is SHARED by all detection modes and lives for the whole run -----------
+    stores = StorageHub(config, camera_info).start()
+    roi = RoiManager(config)
+    roi.start_polling()
+    sinks = LiveSinks()
+    ctx = RuntimeContext(
+        config=config, camera_source=camera_source, camera_info=camera_info,
+        stores=stores, roi=roi, live=sinks, session_id=uuid.uuid4().hex,
+    )
+    manager = ModeManager(
+        ctx, allowed=config.mode.allowed, state_file=config.mode.state_file,
+        remember_last=config.mode.remember_last, preload_on_switch=config.mode.preload_on_switch,
+    )
+    publisher, server = build_live_outputs(config, roi, manager, sinks)
 
     try:
         if config.camera.folder:
-            image_paths = detector.list_images_in_folder(config.camera.folder)
+            image_paths = list_images_in_folder(config.camera.folder)
             if not image_paths:
                 sys.exit(f"No images found in folder: {config.camera.folder}")
-            pipeline.warmup()
-            run_on_images(pipeline, image_paths)
+            manager.start(initial_mode)
+            run_on_images(manager, image_paths)
         elif config.camera.image:
-            pipeline.warmup()
-            run_on_images(pipeline, [config.camera.image])
+            manager.start(initial_mode)
+            run_on_images(manager, [config.camera.image])
         elif config.camera.rtsp_url:
-            run_on_stream(pipeline, config)
+            run_on_stream(manager, config, server, initial_mode)
         else:
-            sys.exit("No source configured - set camera.rtsp_url, camera.image, or camera.folder in config.yaml")
+            sys.exit("No source configured - set camera.rtsp_url, camera.image, or camera.folder (camera/config.yaml)")
     finally:
-        pipeline.shutdown()
+        manager.stop()                     # flushes the active mode's in-flight tracks into the stores
+        if publisher is not None:
+            publisher.stop()
+        if server is not None:
+            server.stop()
+        roi.stop()
         log.info("flushing storage buffer before exit...")
-        storage.stop()
+        stores.stop()
 
 
 if __name__ == "__main__":

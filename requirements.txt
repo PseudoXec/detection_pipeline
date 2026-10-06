@@ -1,6 +1,6 @@
 # Core detection stack
 ultralytics
-opencv-python
+opencv-python>=4.8   # person mode's face detector (cv2.FaceDetectorYN, YuNet 2023mar) needs 4.8 or newer
 numpy
 
 # Configuration file parsing (config.yaml)

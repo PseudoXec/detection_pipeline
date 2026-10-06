@@ -10,6 +10,7 @@ def build_snapshot(
     predictions: List[Dict[str, Any]],
     in_roi_ids: Set[int],
     captured_at: Optional[float] = None,
+    mode: Optional[str] = None,
 ) -> Dict[str, Any]:
     vehicles = []
     for p in predictions:
@@ -23,11 +24,14 @@ def build_snapshot(
             "in_roi": id(p) in in_roi_ids,
         })
     return {
+        "mode": mode,
         "camera_id": camera_id,
         "session_id": session_id,
         "seq": seq,
         "captured_at": captured_at,
         "processed_at": time.time(),
         "frame": {"width": int(frame_shape[1]), "height": int(frame_shape[0])},
+        # NOTE: the key stays "vehicles" for backward compatibility with the dashboard; in person
+        # mode the list holds the person boxes (class "person") and "mode" says so.
         "vehicles": vehicles,
     }

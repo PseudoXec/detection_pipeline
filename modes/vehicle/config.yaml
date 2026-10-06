@@ -1,0 +1,88 @@
+# Vehicle mode: vehicle detect -> plate detect -> OCR. Everything here is used by vehicle mode only.
+# Relative paths are relative to this folder (modes/vehicle/). Machine-specific overrides: config.local.yaml.
+
+model:
+  vehicle_weights: "models/vehicle.onnx"
+  plate_weights: "models/platenum_closeup.onnx"
+  vehicle_imgsz: [512, 896] # [height, width] - must match vehicle.onnx's static shape
+  plate_imgsz: 640 # must match platenum_closeup.onnx's static shape
+  vehicle_conf_threshold: 0.40
+  plate_conf_threshold: 0.35
+  vehicle_classes: null # e.g. "car,truck,bus,motorcycle"; null = accept all
+  agnostic_nms: true # one box per vehicle even when the model flips between classes
+
+roi: # what counts as inside the zone (the polygon itself is in camera/config.yaml)
+  crop_margin: 0.05
+
+tracking:
+  bytetrack_config: "bytetrack.yaml"
+  dedup_cooldown_seconds: 2.0
+  detector_conf_floor: 0.20 # low-conf boxes are loose/oversized; 0.2 still keeps tracks alive
+  plate_dedup_seconds: 30 # the same plate text is saved once per this window, 0 = off
+  max_plate_attempts: 4
+  plate_retry_interval_seconds: 0.4
+  plate_stale_finalize_seconds: 1.5
+  track_ttl_seconds: 30
+  plate_worker_max_queue: 12 # background plate-detection queue depth
+
+crop:
+  plate_min_crop_height: 160
+  plate_padding_pixels: 4
+  plate_padding_ratio: 0.12
+
+preprocess:
+  plate_crop_min_height: 64
+
+ocr:
+  fast_plate_ocr_model: "cct-xs-v2-global-model"
+  cpu_threads: 1
+  min_confidence: 0.5
+  plate_formats: ["LLLDDDD"] # L = letter, D = digit: ABC 1234. Add "LLLDDD" for older plates, "DDDLLL" for some motorcycles
+  plate_format_strict: true # true = reads that fit no format become Unrecognized
+  plate_separator: " " # placed between letter and digit groups, "" for none
+  unrecognized_text: "Unrecognized"
+  accept_score: 0.75
+  early_exit_score: 0.85
+  worker_threads: 1
+  finalize_queue_size: 32
+
+images:
+  jpeg_quality: 90
+  plate_jpeg_quality: 96
+
+features:
+  roi_filter: true
+  roi_crop_detect: true
+  fallback_tracker: true
+  position_dedup: true
+  plate_detection: true
+  async_plate_detection: true # run the plate model off the frame-reading thread (see docs/CHANGES.md)
+  enhance_before_plate_detect: true
+  enhance_plate_crop: true
+  ocr_read: true
+  async_ocr: true
+  save_images_to_disk: true
+
+  time_vehicle_detect: true
+  time_vehicle_crop: true
+  time_plate_detect: true
+  time_plate_crop: true
+
+  print_console: true
+  print_timing: true
+
+  store_to_sqlite: true
+
+  send_via_api: true # needs api.vehicle_endpoint_url and switches.api
+  delete_row_after_api_send: true
+
+  col_vehicle_image: true
+  col_vehicle_box: true
+  col_plate_image: true
+  col_plate_box: true
+  col_vehicle_detect_ms: true
+  col_vehicle_crop_ms: true
+  col_plate_detect_ms: true
+  col_plate_crop_ms: true
+  col_total_pipeline_ms: true
+  col_ocr_read: true

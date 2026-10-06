@@ -1,0 +1,16 @@
+# Live view. The on/off switches (switches.live_stream, switches.live_boxes) are in config/config.yaml.
+# The same server and token also protect the mode switch endpoint (/control/mode).
+live:
+  camera_id: "cam1"
+  serve_host: "0.0.0.0"
+  serve_port: 8090
+  stream_fps: 20
+  stream_width: 960
+  jpeg_quality: 70
+  box_max_age_seconds: 3
+  auth_token: null
+
+  # push mode (switches.live_boxes)
+  endpoint_url: null
+  max_hz: 10
+  timeout_seconds: 1.0

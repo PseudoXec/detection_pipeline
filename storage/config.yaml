@@ -1,0 +1,10 @@
+# One SQLite file holds every mode's table (vehicle: `detections`, person: `person_detections`).
+# Relative paths here are relative to the project root. Per-mode storage options (JPEG quality, whether to
+# send to the API, which columns to fill) are in modes/<mode>/config.yaml.
+storage:
+  database_path: "data/pipeline_buffer.db"
+  output_dir: "output"
+  retention_days: 14
+  max_unsynced_days: 0
+  delete_disk_images_after_send: true
+  send_retry_seconds: 60

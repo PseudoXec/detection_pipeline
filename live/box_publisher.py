@@ -41,6 +41,11 @@ class LiveBoxPublisher:
                  (1.0 / self.min_interval) if self.min_interval else 0.0)
         return self
 
+    def clear(self) -> None:
+        """Drop an unsent snapshot (called when the detection mode changes)."""
+        with self._cond:
+            self._slot = None
+
     def stop(self) -> None:
         self._stop_event.set()
         with self._cond:
@@ -54,12 +59,13 @@ class LiveBoxPublisher:
         predictions: List[Dict[str, Any]],
         in_roi_ids: Set[int],
         captured_at: Optional[float] = None,
+        mode: Optional[str] = None,
     ) -> None:
         try:
             self._seq += 1
             snapshot = build_snapshot(
                 self.camera_id, self.session_id, self._seq,
-                frame_shape, predictions, in_roi_ids, captured_at,
+                frame_shape, predictions, in_roi_ids, captured_at, mode,
             )
             with self._cond:
                 self._slot = snapshot
