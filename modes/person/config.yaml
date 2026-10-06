@@ -1,7 +1,7 @@
 # Person mode: person detect -> face detect -> store. Everything here is used by person mode only.
 # Relative paths are relative to this folder (modes/person/). Machine-specific overrides: config.local.yaml.
 
-weights: "models/person_ncnn_model" # export your person model with tools/export_ncnn.py
+weights: "models/person.onnx" # export your person model with tools/export_ncnn.py
 face_weights: "models/face_detection_yunet_2023mar.onnx" # from the OpenCV Zoo, see models/README.md
 imgsz: 416
 conf_threshold: 0.40
