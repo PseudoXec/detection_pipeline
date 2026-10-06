@@ -2,7 +2,7 @@
 # which is merged on top of this file and ignored by git.
 camera:
   source_mode: "static" # "static" | "api"
-  rtsp_url: "rtsp://admin:Victoria2313*@192.168.100.229:554/stream1"
+  rtsp_url: "rtsp://USER:PASSWORD@CAMERA_IP:554/stream1"
   frame_width: 1280
   frame_height: 720
   capture_buffer_size: 1

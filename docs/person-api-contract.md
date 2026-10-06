@@ -64,7 +64,7 @@ The response body is ignored. A 401/403/404 means a wrong token or URL and is re
 ```bash
 curl -X POST "http://<command-center>/api/AiDetection/PersonDetected" \
   -F EventId=0b1f1c52-2c2e-4d21-9a53-6d7a4c7a9f10 -F DeviceId=pi-01 -F SessionId=3f9c... -F TrackId=p12 \
-  -F CameraId=4 -F CameraName=Gate -F CameraSource=rtsp://192.168.100.229:554/stream1 \
+  -F CameraId=4 -F CameraName=Gate -F CameraSource=rtsp://CAMERA_IP:554/stream1 \
   -F DetectedAt=2026-10-05T14:30:15+08:00 -F FrameWidth=1280 -F FrameHeight=720 \
   -F PersonConfidence=0.9123 -F PersonBoxX1=580.0 -F PersonBoxY1=210.0 -F PersonBoxX2=700.0 -F PersonBoxY2=510.0 \
   -F FaceDetected=true -F FaceConfidence=0.9512 -F FaceBoxX1=40.0 -F FaceBoxY1=10.0 -F FaceBoxX2=80.0 -F FaceBoxY2=60.0 \

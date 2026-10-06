@@ -1,6 +1,20 @@
 __pycache__/
 *.pyc
 .venv/
+
+# runtime data (database, saved plate/face images, mode state)
 data/
 output/
+*.db
+*.db-wal
+*.db-shm
+
+# machine-specific settings and secrets (camera password, server addresses, tokens)
 **/config.local.yaml
+.env
+*.env
+
+# trained weights / exports (re-add a line with ! if you do want a model in git)
+# *.pt
+# *.onnx
+# *_ncnn_model/

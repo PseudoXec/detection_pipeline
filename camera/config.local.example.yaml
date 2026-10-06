@@ -1,0 +1,3 @@
+# Copy to camera/config.local.yaml and fill in. The real file is ignored by git.
+camera:
+  rtsp_url: "rtsp://USER:PASSWORD@CAMERA_IP:554/stream1"
