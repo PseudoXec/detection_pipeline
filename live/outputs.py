@@ -5,7 +5,7 @@ from live.live_server import LiveServer
 from live.sinks import LiveSinks
 
 
-def build_live_outputs(config: PipelineConfig, roi, manager, sinks: LiveSinks):
+def build_live_outputs(config: PipelineConfig, roi, manager, sinks: LiveSinks, device=None):
     """The live view (frames + boxes) and the command-center control endpoint share one HTTP server."""
     publisher = None
     if config.switches.live_boxes:
@@ -32,6 +32,9 @@ def build_live_outputs(config: PipelineConfig, roi, manager, sinks: LiveSinks):
             mode_request=manager.request if control else None,
             mode_choices=manager.choices if control else None,
             live_enabled=config.switches.live_stream,
+            device=device if control else None,
         )
+        if device is not None:
+            device.frame_source = lambda: server._frame_source() if server._frame_source else None
     sinks.publisher, sinks.server = publisher, server
     return publisher, server

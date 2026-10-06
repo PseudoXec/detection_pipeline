@@ -29,8 +29,10 @@ def resolve_camera_source(config: PipelineConfig) -> None:
     config.camera.rtsp_url = source.rtsp_url
 
 
-def resolve_camera_info(config: PipelineConfig):
-    """Camera name / IP / location (Hikvision ISAPI), stamped on every stored event."""
+def resolve_camera_info(config: PipelineConfig, force_refresh: bool = False):
+    """Camera name / IP / location / model / serial (Hikvision ISAPI), stamped on every stored event.
+
+    Reads data/camera_identity.json when it exists (no ISAPI call); force_refresh=True asks the camera again."""
     rtsp_url = config.camera.rtsp_url
     if not rtsp_url:
         return None
@@ -55,4 +57,5 @@ def resolve_camera_info(config: PipelineConfig):
             timeout_seconds=config.camera.isapi_timeout_seconds,
             channel_id=config.camera.isapi_channel_id,
         ),
+        force_refresh=force_refresh,
     )

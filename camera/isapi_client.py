@@ -20,6 +20,10 @@ class CameraDeviceInfo:
     ip_address: Optional[str] = None
     name: Optional[str] = None
     location: Optional[str] = None
+    model: Optional[str] = None
+    serial_number: Optional[str] = None
+    firmware_version: Optional[str] = None
+    mac_address: Optional[str] = None
 
 
 def extract_host(rtsp_url: Optional[str]) -> Optional[str]:
@@ -94,6 +98,10 @@ def fetch_device_info(
     if root is not None:
         info.name = _text(root, "deviceName")
         info.location = _text(root, "deviceLocation")
+        info.model = _text(root, "model")
+        info.serial_number = _text(root, "serialNumber")
+        info.firmware_version = _text(root, "firmwareVersion")
+        info.mac_address = _text(root, "macAddress")
 
     channel_name = _fetch_channel_name(base_url, channel_id, attempts, timeout_seconds)
     if channel_name:

@@ -7,7 +7,10 @@ to the mode manager. Everything with a real job lives in its own folder - this f
 """
 import argparse
 import logging
+import os
+import signal
 import sys
+import threading
 import uuid
 
 import cv2
@@ -16,6 +19,7 @@ from camera.frame_loop import list_images_in_folder, run_on_images, run_on_strea
 from camera.resolve import resolve_camera_info, resolve_camera_source
 from camera.roi_manager import RoiManager
 from config.config import PipelineConfig
+from control.device import RESTART_EXIT_CODE, DeviceService
 from control.mode_manager import ModeManager, choose_initial_mode
 from live.outputs import build_live_outputs
 from live.sinks import LiveSinks
@@ -81,7 +85,15 @@ def main() -> None:
         ctx, allowed=config.mode.allowed, state_file=config.mode.state_file,
         remember_last=config.mode.remember_last, preload_on_switch=config.mode.preload_on_switch,
     )
-    publisher, server = build_live_outputs(config, roi, manager, sinks)
+    restart_requested = threading.Event()
+
+    def request_restart() -> None:
+        """Command center asked for a restart: stop gracefully (buffer flushed), then exit non-zero so systemd restarts us."""
+        restart_requested.set()
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    device = DeviceService(ctx, manager, request_restart)
+    publisher, server = build_live_outputs(config, roi, manager, sinks, device)
 
     try:
         if config.camera.folder:
@@ -106,6 +118,10 @@ def main() -> None:
         roi.stop()
         log.info("flushing storage buffer before exit...")
         stores.stop()
+
+    if restart_requested.is_set():
+        log.warning("exiting with code %d so the service manager restarts the pipeline", RESTART_EXIT_CODE)
+        sys.exit(RESTART_EXIT_CODE)
 
 
 if __name__ == "__main__":

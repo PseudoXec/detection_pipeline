@@ -89,6 +89,7 @@ class LiveServer:
         mode_request: Optional[Callable[[str, str], Dict[str, Any]]] = None,
         mode_choices: Optional[Callable[[], List[str]]] = None,
         live_enabled: bool = True,
+        device: Optional[Any] = None,
     ):
         self.camera_id = camera_id
         self.host = host
@@ -111,6 +112,8 @@ class LiveServer:
         self._mode_status = mode_status
         self._mode_request = mode_request
         self._mode_choices = mode_choices
+        # device management (control/device.py): /device, /device/buffer, /control/refresh-identity, /control/restart
+        self._device = device
         # False = serve only /control/* and /live/health; the camera image/boxes stay private
         self.live_enabled = live_enabled
 
@@ -434,6 +437,11 @@ class LiveServer:
                     if url.path == "/control/mode":
                         return self._mode_get()
 
+                    if url.path in ("/device", "/device/buffer"):
+                        if server._device is None:
+                            return self._json(404, {"error": "device management is not enabled"})
+                        return self._json(200, server._device.device() if url.path == "/device" else server._device.buffer())
+
                     if url.path.startswith("/live/") and url.path != "/live/health" and not server.live_enabled:
                         return self._json(404, {"error": "live view is disabled (features.live_stream is false)"})
 
@@ -476,6 +484,15 @@ class LiveServer:
 
                     if url.path == "/control/mode":
                         return self._mode_post(query)
+
+                    if url.path in ("/control/refresh-identity", "/control/restart"):
+                        if server._device is None:
+                            return self._json(404, {"error": "device management is not enabled"})
+                        if url.path == "/control/refresh-identity":
+                            result = server._device.refresh_identity()
+                            return self._json(200 if result["ok"] else 502, result)
+                        result = server._device.restart(force=query.get("force", ["0"])[0] in ("1", "true", "yes"))
+                        return self._json(202 if result["ok"] else 409, result)
 
                     self._json(404, {"error": "not found"})
                 except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):

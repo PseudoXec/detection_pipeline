@@ -11,7 +11,7 @@ import json
 import logging
 import os
 import tempfile
-from dataclasses import asdict
+from dataclasses import asdict, fields
 from typing import Callable, Optional
 
 from camera.isapi_client import CameraDeviceInfo
@@ -25,9 +25,8 @@ def load_identity(host: Optional[str], path: str = IDENTITY_FILE) -> Optional[Ca
     try:
         with open(path, "r", encoding="utf-8") as handle:
             data = json.load(handle)
-        info = CameraDeviceInfo(
-            ip_address=data.get("ip_address"), name=data.get("name"), location=data.get("location"),
-        )
+        known = {f.name for f in fields(CameraDeviceInfo)}
+        info = CameraDeviceInfo(**{k: v for k, v in data.items() if k in known})
     except (OSError, ValueError, TypeError):
         return None
     if host and info.ip_address and info.ip_address != host:

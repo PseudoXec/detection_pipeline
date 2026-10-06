@@ -142,6 +142,30 @@ class BufferedStore:
         if self.can_send():
             self.send_new(connection, records, row_ids)
 
+    # ------------------------------------------------------------------ status (command center)
+    def status(self) -> Dict[str, Any]:
+        """Row counts by delivery state, queue depth and database size - cheap enough to poll."""
+        info: Dict[str, Any] = {
+            "table": self.TABLE, "send_via_api": self.send_via_api,
+            "queue_depth": self._queue.qsize(),
+            "writer_alive": bool(self._thread and self._thread.is_alive()),
+        }
+        connection = self._connect()
+        try:
+            rows = connection.execute(f"SELECT synced, COUNT(*) FROM {self.TABLE} GROUP BY synced").fetchall()
+            counts = {int(k): int(v) for k, v in rows}
+            oldest = connection.execute(
+                f"SELECT MIN(detected_at) FROM {self.TABLE} WHERE synced = 0").fetchone()[0]
+            info.update(
+                total_rows=sum(counts.values()), waiting=counts.get(0, 0),
+                delivered=counts.get(1, 0), rejected=counts.get(2, 0), oldest_waiting_at=oldest,
+            )
+        except sqlite3.Error as error:
+            info["error"] = str(error)
+        finally:
+            connection.close()
+        return info
+
     # ------------------------------------------------------------------ marking rows
     def finish_rows(self, connection: sqlite3.Connection, sent_ids: List[int], skipped_ids: List[int],
                     delete_sent: bool, rejected_ids: Optional[List[int]] = None) -> None:
