@@ -1,4 +1,5 @@
-# Vehicle mode: vehicle detect -> plate detect -> OCR. Everything here is used by vehicle mode only.
+# Vehicle mode: vehicle detect → crop → plate detect → crop → send metadata.
+# Everything here is used by vehicle mode only.
 # Relative paths are relative to this folder (modes/vehicle/). Machine-specific overrides: config.local.yaml.
 
 model:
@@ -18,7 +19,6 @@ tracking:
   bytetrack_config: "bytetrack.yaml"
   dedup_cooldown_seconds: 2.0
   detector_conf_floor: 0.20 # low-conf boxes are loose/oversized; 0.2 still keeps tracks alive
-  plate_dedup_seconds: 30 # the same plate text is saved once per this window, 0 = off
   max_plate_attempts: 4
   plate_retry_interval_seconds: 0.4
   plate_stale_finalize_seconds: 1.5
@@ -33,19 +33,6 @@ crop:
 preprocess:
   plate_crop_min_height: 64
 
-ocr:
-  fast_plate_ocr_model: "cct-xs-v2-global-model"
-  cpu_threads: 1
-  min_confidence: 0.5
-  plate_formats: ["LLLDDDD"] # L = letter, D = digit: ABC 1234. Add "LLLDDD" for older plates, "DDDLLL" for some motorcycles
-  plate_format_strict: true # true = reads that fit no format become Unrecognized
-  plate_separator: " " # placed between letter and digit groups, "" for none
-  unrecognized_text: "Unrecognized"
-  accept_score: 0.75
-  early_exit_score: 0.85
-  worker_threads: 1
-  finalize_queue_size: 32
-
 images:
   jpeg_quality: 90
   plate_jpeg_quality: 96
@@ -56,11 +43,9 @@ features:
   fallback_tracker: true
   position_dedup: true
   plate_detection: true
-  async_plate_detection: true # run the plate model off the frame-reading thread (see docs/CHANGES.md)
+  async_plate_detection: true # run the plate model off the frame-reading thread (see plate_worker.py)
   enhance_before_plate_detect: true
   enhance_plate_crop: true
-  ocr_read: true
-  async_ocr: true
   save_images_to_disk: true
 
   time_vehicle_detect: true
@@ -85,4 +70,3 @@ features:
   col_plate_detect_ms: true
   col_plate_crop_ms: true
   col_total_pipeline_ms: true
-  col_ocr_read: true

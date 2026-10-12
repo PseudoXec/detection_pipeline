@@ -1,6 +1,5 @@
 import logging
 import time
-import threading
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -8,13 +7,11 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 from core import detector, image_ops
-from core.finalize_worker import FinalizeJob, FinalizeWorkerPool
 from core.geometry import box_edges, crop_box, point_in_polygon
 from core.tracker import FallbackTracker, PositionDeduper, needs_fallback_tracker
 from modes.vehicle import plate_enhance
 from modes.vehicle.geometry import crop_plate, is_inside_roi
 from modes.base import DetectionMode, RuntimeContext
-from modes.vehicle.ocr import build_ocr_reader
 from modes.vehicle.plate_worker import PlateDetectionWorker
 from modes.vehicle.store import DetectionRecord
 from modes.vehicle.timing import VehicleTiming, Stopwatch
@@ -31,14 +28,10 @@ class _PlateCandidate:
     plate_crop: np.ndarray
     plate_conf: float
     crop_ms: Optional[float]
-    raw_crop: Optional[np.ndarray] = None
-    ocr_text: Optional[str] = None
-    ocr_score: float = 0.0
-    ocr_attempted: bool = False
 
     @property
-    def rank(self) -> Tuple[float, float]:
-        return (self.ocr_score, self.plate_conf)
+    def rank(self) -> float:
+        return self.plate_conf
 
 
 @dataclass
@@ -55,7 +48,7 @@ class _TrackState:
 
 
 class VehicleMode(DetectionMode):
-    """Vehicle -> plate -> OCR pipeline. Everything it starts, it stops again in stop()."""
+    """Vehicle → plate detection pipeline. Everything it starts, it stops again in stop()."""
 
     name = "vehicle"
 
@@ -70,8 +63,6 @@ class VehicleMode(DetectionMode):
         self.vehicle_model = None
         self.plate_model = None
         self.plate_worker: Optional[PlateDetectionWorker] = None
-        self.finalize_pool: Optional[FinalizeWorkerPool] = None
-        self.ocr_reader = None
         self._stopped = False
         try:
             self._load(config)
@@ -113,17 +104,8 @@ class VehicleMode(DetectionMode):
             position_threshold=config.tracking.dedup_position_threshold,
         )
 
-        self.ocr_reader = build_ocr_reader(config.ocr) if config.features.ocr_read else None
-
-        if config.features.async_ocr and self.ocr_reader is not None:
-            self.finalize_pool = FinalizeWorkerPool(
-                self.storage, worker_threads=config.ocr.worker_threads, max_queue=config.ocr.finalize_queue_size,
-            ).start()
-
         self._tracks: Dict[str, _TrackState] = {}
         self._aliases: Dict[str, str] = {}
-        self._recent_plates: Dict[str, float] = {}
-        self._plate_lock = threading.Lock()
         self._last_prune = time.monotonic()
         self._session_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
         self._last_vehicle_detect_ms: Optional[float] = None
@@ -316,28 +298,16 @@ class VehicleMode(DetectionMode):
         if raw_crop is None:
             return None
 
-        candidate = _PlateCandidate(
+        return _PlateCandidate(
             vehicle_crop=vehicle_crop, box=box, plate_crop=plate_crop,
             plate_conf=float(best_plate.get("confidence", 0.0)),
             crop_ms=sw.ms if features.time_plate_crop else None,
-            raw_crop=raw_crop if raw_crop is not plate_crop else None,
         )
-
-        if self.ocr_reader is not None and self.finalize_pool is None:
-            try:
-                candidate.ocr_text, candidate.ocr_score = self.ocr_reader.read_scored(plate_crop, candidate.raw_crop)
-            except Exception as error:
-                if features.print_console:
-                    print(f"[pipeline] OCR read failed: {error}")
-            candidate.ocr_attempted = True
-        return candidate
 
     def _is_good_enough(self, candidate: Optional[_PlateCandidate]) -> bool:
         if candidate is None:
             return False
-        if self.finalize_pool is not None or self.ocr_reader is None or getattr(self.ocr_reader, "_load_failed", False):
-            return candidate.plate_conf >= self.config.model.plate_conf_threshold
-        return bool(candidate.ocr_text) and candidate.ocr_score >= self.config.ocr.accept_score
+        return candidate.plate_conf >= self.config.model.plate_conf_threshold
 
     def _flush_stale_pending(self, now: float) -> None:
         wait = self.config.tracking.plate_stale_finalize_seconds
@@ -360,15 +330,6 @@ class VehicleMode(DetectionMode):
             return
         timing, base_prediction, stem = state.timing, state.prediction, state.stem
 
-        if best is not None and self.finalize_pool is not None:
-            job = FinalizeJob(
-                track_id=track_id,
-                build_record=lambda: self._build_record(track_id, best, vehicle_crop, base_prediction, timing, stem),
-            )
-            if self.finalize_pool.submit(job):
-                state.finalized, state.crop, state.best = True, None, None
-                return
-
         record = self._build_record(track_id, best, vehicle_crop, base_prediction, timing, stem)
         if self.config.features.store_to_sqlite and record is not None:
             self.storage.enqueue(record)
@@ -386,18 +347,7 @@ class VehicleMode(DetectionMode):
         plate_detected = False
         plate_x1 = plate_y1 = plate_x2 = plate_y2 = None
 
-        ocr_process = False
-        ocr_read = self.config.ocr.unrecognized_text
-
         if best is not None:
-            if not best.ocr_attempted and self.ocr_reader is not None:
-                try:
-                    best.ocr_text, best.ocr_score = self.ocr_reader.read_scored(best.plate_crop, best.raw_crop)
-                except Exception as error:
-                    if features.print_console:
-                        print(f"[pipeline] OCR read failed for {track_id}: {error}")
-                best.ocr_attempted = True
-
             plate_x1, plate_y1, plate_x2, plate_y2 = best.box
             timing.plate_crop_ms = best.crop_ms
             plate_confidence = best.plate_conf
@@ -405,13 +355,6 @@ class VehicleMode(DetectionMode):
             plate_detected = True
             if disk_files is not None:
                 disk_files[f"plate_detection/{stem}_plate.jpg"] = plate_image_bytes
-            ocr_process = True
-            ocr_read = best.ocr_text if best.ocr_text else self.config.ocr.unrecognized_text
-
-        if best is not None and best.ocr_text and self._is_duplicate_plate(best.ocr_text):
-            log.info("[pipeline] %s dropped - plate %s was already recorded in the last %.0fs",
-                     track_id, best.ocr_text, self.config.tracking.plate_dedup_seconds)
-            return None
 
         vehicle_x1, vehicle_y1, vehicle_x2, vehicle_y2 = box_edges(base_prediction)
 
@@ -444,13 +387,11 @@ class VehicleMode(DetectionMode):
             plate_detect_ms=timing.plate_detect_ms if features.col_plate_detect_ms else None,
             plate_crop_ms=timing.plate_crop_ms if features.col_plate_crop_ms else None,
             total_pipeline_ms=timing.total_ms if features.col_total_pipeline_ms else None,
-            ocr_process=ocr_process if features.col_ocr_read else False,
-            ocr_read=ocr_read if features.col_ocr_read else self.config.ocr.unrecognized_text,
             disk_files=disk_files,
         )
 
         if features.print_console:
-            status = f"plate found ({plate_confidence:.2f}) - ocr: {ocr_read}" if plate_detected else "no plate found"
+            status = f"plate found ({plate_confidence:.2f})" if plate_detected else "no plate found"
             if features.print_timing:
                 breakdown = (
                     f"vehicle_detect={self._fmt_ms(timing.vehicle_detect_ms)} "
@@ -465,18 +406,6 @@ class VehicleMode(DetectionMode):
 
         return record
 
-    def _is_duplicate_plate(self, text: str) -> bool:
-        window = self.config.tracking.plate_dedup_seconds
-        if window <= 0:
-            return False
-        key = "".join(ch for ch in text.upper() if ch.isalnum())
-        now = time.monotonic()
-        with self._plate_lock:
-            for stale in [k for k, seen in self._recent_plates.items() if now - seen > window]:
-                del self._recent_plates[stale]
-            duplicate = key in self._recent_plates
-            self._recent_plates[key] = now
-        return duplicate
 
     def stop(self) -> None:
         """Hand in-flight vehicles to storage, stop every worker thread, free the models."""
@@ -493,18 +422,15 @@ class VehicleMode(DetectionMode):
                 except Exception as error:
                     log.warning("could not store track %s while stopping: %s", track_id, error)
 
-        # 2) workers: the finalize pool drains its queue (those jobs write to storage), then plate worker
-        if self.finalize_pool is not None:
-            self.finalize_pool.stop()
+        # 2) stop the plate worker; no finalize pool in the lean flow
         plate_worker_done = True
         if self.plate_worker is not None:
             plate_worker_done = self.plate_worker.stop()
 
-        # 3) release models. If a worker is somehow still inside an inference we only drop our references
-        #    (the thread owns the model until it ends) instead of tearing it down underneath it.
+        # 3) release models
         models = [self.vehicle_model] + ([self.plate_model] if plate_worker_done else [])
         self.vehicle_model = self.plate_model = None
-        self.plate_worker = self.finalize_pool = self.ocr_reader = None
+        self.plate_worker = None
         if getattr(self, "_tracks", None) is not None:
             self._tracks.clear()
         detector.release_models(*models)

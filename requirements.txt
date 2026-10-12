@@ -22,6 +22,3 @@ lap>=0.5.12          # required by ByteTrack (the tracker used in tracker.py)
 #   pip install opencv-python-headless
 requests>=2.31.0
 
-# Plate-text OCR (features.ocr_read: true). PaddleOCR has been removed entirely -
-# fast-plate-ocr (single-line-plate ONNX model, MIT licensed, free) is the only backend.
-fast-plate-ocr[onnx]

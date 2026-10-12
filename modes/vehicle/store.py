@@ -38,8 +38,6 @@ class DetectionRecord:
     plate_detect_ms: Optional[float]
     plate_crop_ms: Optional[float]
     total_pipeline_ms: Optional[float]
-    ocr_process: bool
-    ocr_read: str
     disk_files: Optional[Dict[str, bytes]] = None
 
 
@@ -68,8 +66,6 @@ CREATE TABLE IF NOT EXISTS detections (
     plate_detect_ms     REAL,
     plate_crop_ms       REAL,
     total_pipeline_ms   REAL,
-    ocr_process          INTEGER NOT NULL DEFAULT 0,
-    ocr_read             TEXT,
     camera_name          TEXT,
     camera_ip            TEXT,
     camera_location      TEXT,
@@ -115,10 +111,6 @@ class DetectionStorage(BufferedStore):
         existing = {row[1] for row in connection.execute("PRAGMA table_info(detections)")}
         if "vehicle_detect_ms" not in existing:
             connection.execute("ALTER TABLE detections ADD COLUMN vehicle_detect_ms REAL")
-        if "ocr_process" not in existing:
-            connection.execute("ALTER TABLE detections ADD COLUMN ocr_process INTEGER NOT NULL DEFAULT 0")
-        if "ocr_read" not in existing:
-            connection.execute("ALTER TABLE detections ADD COLUMN ocr_read TEXT")
         for column in ("camera_name", "camera_ip", "camera_location"):
             if column not in existing:
                 connection.execute(f"ALTER TABLE detections ADD COLUMN {column} TEXT")
@@ -136,9 +128,8 @@ class DetectionStorage(BufferedStore):
                         plate_detected, plate_confidence, plate_image,
                         plate_box_x1, plate_box_y1, plate_box_x2, plate_box_y2,
                         detected_at, vehicle_detect_ms, vehicle_crop_ms, plate_detect_ms, plate_crop_ms,
-                        total_pipeline_ms, ocr_process, ocr_read,
-                        camera_name, camera_ip, camera_location
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        total_pipeline_ms, camera_name, camera_ip, camera_location
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         record.track_id, record.camera_source, record.vehicle_class,
@@ -149,7 +140,6 @@ class DetectionStorage(BufferedStore):
                         record.detected_at.isoformat(sep=" ", timespec="seconds"),
                         record.vehicle_detect_ms, record.vehicle_crop_ms,
                         record.plate_detect_ms, record.plate_crop_ms, record.total_pipeline_ms,
-                        1 if record.ocr_process else 0, record.ocr_read,
                         self.camera_name, self.camera_ip, self.camera_location,
                     ),
                 )
@@ -179,6 +169,7 @@ class DetectionStorage(BufferedStore):
             return
         from api import vehicle_client
 
+        # rows without a plate are never sent - mark them delivered so they don't pile up
         leftovers = [row[0] for row in connection.execute(
             "SELECT id FROM detections WHERE synced = 0 AND plate_detected = 0")]
         self.finish_rows(connection, [], leftovers, self.delete_row_after_api_send)
@@ -228,5 +219,4 @@ class DetectionStorage(BufferedStore):
             vehicle_detect_ms=row["vehicle_detect_ms"], vehicle_crop_ms=row["vehicle_crop_ms"],
             plate_detect_ms=row["plate_detect_ms"], plate_crop_ms=row["plate_crop_ms"],
             total_pipeline_ms=row["total_pipeline_ms"],
-            ocr_process=bool(row["ocr_process"]), ocr_read=row["ocr_read"] or "Unrecognized",
         )

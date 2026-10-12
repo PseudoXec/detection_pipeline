@@ -1,6 +1,5 @@
 import logging
-from typing import TYPE_CHECKING
-from typing import Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import requests
 
@@ -18,10 +17,7 @@ def record_to_query_params(
     camera_ip: Optional[str] = None,
     camera_location: Optional[str] = None,
 ) -> Dict[str, Any]:
-    plate_text = getattr(record, "ocr_read", "UNRECOGNIZED") if record.plate_detected else "NO_PLATE"
-
     params: Dict[str, Any] = {
-        "PlateNumber": plate_text,
         "CameraTargetID": 1,
         "DetectionConfidence": round(record.vehicle_confidence or 0.0, 2),
         "DetectedVehicle": record.vehicle_class or "Unknown",

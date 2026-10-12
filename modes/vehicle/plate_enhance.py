@@ -1,4 +1,4 @@
-"""Plate-image enhancement (vehicle mode only): sharpen/denoise before plate detection and before OCR."""
+"""Plate-image enhancement (vehicle mode only): sharpen/denoise before plate detection and enhance plate crop."""
 import cv2
 import numpy as np
 

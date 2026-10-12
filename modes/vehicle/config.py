@@ -1,4 +1,4 @@
-"""Every setting that only vehicle mode uses: models, thresholds, tracking, crops, OCR, ROI rules, features."""
+"""Every setting that only vehicle mode uses: models, thresholds, tracking, crops, ROI rules, features."""
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import ClassVar, Dict, List, Optional, Union
@@ -37,7 +37,6 @@ class TrackingConfig:
     dedup_cooldown_seconds: float = 2.0
     dedup_position_threshold: float = 1.0
     detector_conf_floor: float = 0.10
-    plate_dedup_seconds: float = 30.0
 
     max_plate_attempts: int = 1
     plate_retry_interval_seconds: float = 0.4
@@ -60,23 +59,6 @@ class CropConfig:
 @dataclass
 class PreprocessConfig:
     plate_crop_min_height: int = 64
-
-
-@dataclass
-class OcrConfig:
-    fast_plate_ocr_model: str = "cct-xs-v2-global-model"
-    cpu_threads: int = 1
-    min_confidence: float = 0.5
-    allowed_chars: str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-    plate_formats: List[str] = field(default_factory=lambda: ["LLLDDDD"])
-    plate_format_strict: bool = True
-    plate_separator: str = " "
-    unrecognized_text: str = "Unrecognized"
-    accept_score: float = 0.75
-    early_exit_score: float = 0.85
-    worker_threads: int = 1
-    finalize_queue_size: int = 32
-
 
 @dataclass
 class RoiRulesConfig:
@@ -105,8 +87,6 @@ class FeaturesConfig:
     async_plate_detection: bool = True   # run the plate model on a background thread (modes/vehicle/plate_worker.py)
     enhance_before_plate_detect: bool = True
     enhance_plate_crop: bool = True
-    ocr_read: bool = True
-    async_ocr: bool = True
     save_images_to_disk: bool = True
 
     time_vehicle_detect: bool = True
@@ -131,7 +111,6 @@ class FeaturesConfig:
     col_plate_detect_ms: bool = True
     col_plate_crop_ms: bool = True
     col_total_pipeline_ms: bool = True
-    col_ocr_read: bool = True
 
 
 @dataclass
@@ -140,7 +119,6 @@ class VehicleConfig:
     tracking: TrackingConfig = field(default_factory=TrackingConfig)
     crop: CropConfig = field(default_factory=CropConfig)
     preprocess: PreprocessConfig = field(default_factory=PreprocessConfig)
-    ocr: OcrConfig = field(default_factory=OcrConfig)
     roi: RoiRulesConfig = field(default_factory=RoiRulesConfig)
     images: ImagesConfig = field(default_factory=ImagesConfig)
     features: FeaturesConfig = field(default_factory=FeaturesConfig)
