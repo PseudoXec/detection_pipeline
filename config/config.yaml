@@ -3,33 +3,26 @@
 #
 #   camera/config.yaml         the camera (RTSP URL...) and the ROI polygon
 #   api/config.yaml            command-center endpoint URLs
-#   live/config.yaml           live view server (port, token, quality)
 #   storage/config.yaml        the shared SQLite buffer (paths, retention)
-#   modes/vehicle/config.yaml  everything vehicle mode needs (models, thresholds, OCR, ROI rules ...)
+#   modes/vehicle/config.yaml  everything vehicle mode needs (models, thresholds, ROI rules ...)
 #   modes/person/config.yaml   everything person mode needs  (models, face search, ROI rules ...)
 #
 # Machine-specific values (passwords, IPs): put them in a `config.local.yaml` next to the file they
 # belong to; it is merged on top and never committed.
 # ======================================================================================================
 
-# Which detection pipeline is running. The command center switches it at runtime with
-#   POST http://<pi>:8090/control/mode   {"mode": "person"}        GET /control/mode shows the status
-# (same port and live.auth_token as the live view). Only ONE mode processes frames; the other is
-# unloaded, so an unused pipeline costs no CPU and no RAM.
+# Which detection pipeline is running.
 mode:
-  default: "vehicle" # used when the command center has not chosen anything yet
-  allowed: ["vehicle", "person", "idle"] # idle = camera + live view only, no detection, no models loaded
-  remember_last: true # resume the command center's last choice after a reboot / crash
+  default: "vehicle" # used when nothing was saved yet
+  allowed: ["vehicle", "person", "idle"]
+  remember_last: true
   state_file: "data/active_mode.json"
-  preload_on_switch: true # load the new mode while the old one keeps detecting (no gap; needs RAM for both for a few seconds). false = free the old mode first (gap, but lowest memory)
-  control_enabled: true # serve /control/mode; works even when switches.live_stream is false
+  preload_on_switch: true
 
 # On / off
 switches:
   api: true # master switch: off = no ROI fetch, no camera source fetch, nothing is sent to the command center
   roi_fetch_from_api: true
-  live_stream: true # camera image + boxes in the browser (the settings are in live/config.yaml)
-  live_boxes: false # push the boxes to the command center instead
   show_preview: false # local OpenCV window (desktop testing only)
 
 # Process-wide

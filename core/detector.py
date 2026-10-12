@@ -1,134 +1,16 @@
 import gc
 import logging
 import os
-import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 
 try:
     from ultralytics import YOLO
-except ImportError:  # only needed once a model is actually loaded (see load_model)
+except ImportError:
     YOLO = None
 
 log = logging.getLogger("pipeline")
-
-# ---- box stabiliser -------------------------------------------------------------------------
-# ByteTrack reports its own smoothed (Kalman) box. When a track gets matched to a wrong / merged
-# detection that box can suddenly become huge (or tiny) for a single update. A real vehicle only
-# changes size gradually, so the size of each track may change by at most this factor per update.
-MAX_SIZE_STEP = 1.35        # width/height may grow at most 35 % per update
-MAX_SHRINK_STEP = 2.0       # ...but may SHRINK faster: an oversized first box must settle quickly
-# ByteTrack (config/bytetrack_custom.yaml: track_buffer) keeps a lost track alive internally for up
-# to `track_buffer` frames before dropping it, and a re-matched track keeps its v-number. This must
-# stay >= track_buffer / camera.max_fps, or a track that reappears after a longer-than-that gap skips
-# the clamp entirely ("starts fresh") right when it's most likely to reappear with a bad size (its
-# Kalman box was coasting, uncorrected, the whole time it was lost). 30 frames / 10 fps = 3s; kept
-# with margin.
-SIZE_MEMORY_SECONDS = 4.0
-SIZE_PRUNE_SECONDS = 30.0
-MAX_FRAME_FRACTION = 0.80   # a box wider/taller than this share of the frame is never a single vehicle
-
-# ---- tracker lag ------------------------------------------------------------------------------
-# Stock ByteTrack trusts its constant-velocity model much more than the newest detection, so the
-# reported box trails a moving vehicle. A larger velocity noise makes it follow the detector faster
-# (stock is 1/160). Set to None to leave ultralytics untouched.
-KALMAN_VELOCITY_WEIGHT: Optional[float] = 1.0 / 25
-
-# The reported box comes from ByteTrack's Kalman state (x, y, aspect ratio, height). Ultralytics hard-codes
-# a very small noise for the ASPECT RATIO (process 1e-2, measurement 1e-1), so the filter barely believes
-# new detections about a vehicle's width/height ratio: if a track's first detection is off (a vehicle
-# only partly in view, a loose low-confidence box) the box keeps that wrong width for 15+ frames even
-# though every following detection is right - the vehicle "enters" with a wrong-sized box that only
-# slowly resizes. After each update the aspect ratio is moved this share of the way to the detection
-# (0 = stock behaviour, 1 = take the detection's ratio as is; 0.6 settles in ~3 updates).
-KALMAN_ASPECT_FOLLOW: Optional[float] = 0.6
-
-
-def tune_tracker_kalman(
-    velocity_weight: Optional[float] = KALMAN_VELOCITY_WEIGHT,
-    aspect_follow: Optional[float] = KALMAN_ASPECT_FOLLOW,
-) -> bool:
-    """Make ByteTrack follow the detector more closely. Safe no-op if ultralytics' internals differ."""
-    if not velocity_weight and not aspect_follow:
-        return False
-    try:
-        from ultralytics.trackers import byte_tracker
-        from ultralytics.trackers.utils import kalman_filter
-        filter_cls = kalman_filter.KalmanFilterXYAH
-        if getattr(filter_cls, "_lag_tuned", False):
-            return True
-
-        if velocity_weight:
-            original_init = filter_cls.__init__
-
-            def tuned_init(self, *args, **kwargs):
-                original_init(self, *args, **kwargs)
-                self._std_weight_velocity = velocity_weight
-
-            filter_cls.__init__ = tuned_init
-            shared = getattr(byte_tracker.STrack, "shared_kalman", None)  # already built at import time
-            if shared is not None:
-                shared._std_weight_velocity = velocity_weight
-
-        if aspect_follow:
-            original_update = filter_cls.update
-
-            def tuned_update(self, mean, covariance, measurement, *args, **kwargs):
-                # *args/**kwargs: newer ultralytics versions pass an extra `confidence` argument
-                new_mean, new_covariance = original_update(self, mean, covariance, measurement, *args, **kwargs)
-                new_mean[2] += aspect_follow * (measurement[2] - new_mean[2])
-                return new_mean, new_covariance
-
-            filter_cls.update = tuned_update
-
-        filter_cls._lag_tuned = True
-        return True
-    except Exception as error:  # different ultralytics version - keep stock behaviour
-        log.warning("[detector] could not tune the tracker's Kalman filter (%s) - using stock ByteTrack", error)
-        return False
-
-
-class BoxStabilizer:
-    """Per-track size gate: stops one bad update from turning a small vehicle into a giant box."""
-
-    def __init__(self, max_step: float = MAX_SIZE_STEP, memory_seconds: float = SIZE_MEMORY_SECONDS):
-        self.max_step = max_step
-        self.memory_seconds = memory_seconds
-        self._last: Dict[str, Tuple[float, float, float]] = {}   # track_id -> (w, h, time)
-        self._last_prune = time.monotonic()
-
-    def apply(self, prediction: Dict[str, Any], frame_w: float, frame_h: float, now: float) -> bool:
-        """Clamp the prediction in place. Returns False if it should be dropped entirely."""
-        width, height = prediction["width"], prediction["height"]
-        if width <= 1 or height <= 1:
-            return False
-        if width > MAX_FRAME_FRACTION * frame_w or height > MAX_FRAME_FRACTION * frame_h:
-            return False
-
-        track_id = prediction.get("track_id")
-        if track_id is None:
-            return True
-
-        previous = self._last.get(track_id)
-        if previous is not None and now - previous[2] <= self.memory_seconds:
-            prev_w, prev_h = previous[0], previous[1]
-            new_w = min(max(width, prev_w / MAX_SHRINK_STEP), prev_w * self.max_step)
-            new_h = min(max(height, prev_h / MAX_SHRINK_STEP), prev_h * self.max_step)
-            if new_w != width or new_h != height:
-                log.debug("[detector] %s size %.0fx%.0f -> %.0fx%.0f (was %.0fx%.0f)",
-                          track_id, width, height, new_w, new_h, prev_w, prev_h)
-                prediction["width"], prediction["height"] = new_w, new_h
-                width, height = new_w, new_h
-        self._last[track_id] = (width, height, now)
-
-        if now - self._last_prune > SIZE_PRUNE_SECONDS:
-            self._last_prune = now
-            self._last = {t: v for t, v in self._last.items() if now - v[2] <= SIZE_PRUNE_SECONDS}
-        return True
-
-
-_stabilizer = BoxStabilizer()
 
 
 class InferenceError(RuntimeError):
@@ -266,6 +148,43 @@ def _boxes_to_predictions(result: Any, classes: Optional[Set[str]] = None) -> Li
     return predictions
 
 
+def detect(
+    model: Any,
+    frame: np.ndarray,
+    conf_threshold: float,
+    iou_threshold: float,
+    imgsz: "int | list | tuple",
+    classes: Optional[Set[str]] = None,
+    region: Optional[Tuple[int, int, int, int]] = None,
+    agnostic_nms: bool = False,
+) -> List[Dict[str, Any]]:
+    source = frame
+    offset_x = offset_y = 0
+    if region is not None:
+        region_x1, region_y1, region_x2, region_y2 = region
+        if region_x2 > region_x1 and region_y2 > region_y1:
+            source = np.ascontiguousarray(frame[region_y1:region_y2, region_x1:region_x2])
+            offset_x, offset_y = region_x1, region_y1
+
+    try:
+        results = model.predict(
+            source=source, conf=conf_threshold, iou=iou_threshold, imgsz=normalize_imgsz(imgsz),
+            agnostic_nms=agnostic_nms, verbose=False,
+        )
+    except Exception as error:
+        raise InferenceError(f"Detection failed: {error}") from error
+
+    if not results:
+        return []
+
+    predictions = _boxes_to_predictions(results[0], classes)
+    if offset_x or offset_y:
+        for p in predictions:
+            p["x"] += offset_x
+            p["y"] += offset_y
+    return predictions
+
+
 def detect_batch(
     model: Any,
     images: List[np.ndarray],
@@ -285,7 +204,8 @@ def detect_batch(
     results = None
     if len(batch_images) == 1 or not getattr(model, "_batch_predict_unsupported", False):
         try:
-            results = model.predict(source=batch_images, conf=conf_threshold, iou=iou_threshold, imgsz=normalize_imgsz(imgsz), verbose=False)
+            results = model.predict(source=batch_images, conf=conf_threshold, iou=iou_threshold,
+                                    imgsz=normalize_imgsz(imgsz), verbose=False)
         except Exception as error:
             if len(batch_images) == 1:
                 raise InferenceError(f"Batch detection failed on 1 image: {error}") from error
@@ -295,7 +215,8 @@ def detect_batch(
         try:
             results = []
             for image in batch_images:
-                results.extend(model.predict(source=[image], conf=conf_threshold, iou=iou_threshold, imgsz=normalize_imgsz(imgsz), verbose=False))
+                results.extend(model.predict(source=[image], conf=conf_threshold, iou=iou_threshold,
+                                             imgsz=normalize_imgsz(imgsz), verbose=False))
         except Exception as error:
             raise InferenceError(f"Batch detection failed on {len(batch_images)} image(s): {error}") from error
 
@@ -307,81 +228,7 @@ def detect_batch(
     return output
 
 
-def track(
-    model: Any,
-    frame: np.ndarray,
-    conf_threshold: float,
-    iou_threshold: float,
-    imgsz: "int | list | tuple",
-    tracker_config: str,
-    classes: Optional[Set[str]] = None,
-    region: Optional[Tuple[int, int, int, int]] = None,
-    detect_conf: Optional[float] = None,
-    agnostic_nms: bool = False,
-    id_prefix: str = "v",
-    stabilizer: Optional["BoxStabilizer"] = None,
-) -> List[Dict[str, Any]]:
-    tune_tracker_kalman()
-    stabilizer = stabilizer if stabilizer is not None else _stabilizer
-    source = frame
-    offset_x = offset_y = 0
-    if region is not None:
-        region_x1, region_y1, region_x2, region_y2 = region
-        if region_x2 > region_x1 and region_y2 > region_y1:
-            source = np.ascontiguousarray(frame[region_y1:region_y2, region_x1:region_x2])
-            offset_x, offset_y = region_x1, region_y1
-
-    try:
-        floor = min(conf_threshold, detect_conf) if detect_conf else conf_threshold
-        results = model.track(
-            source=source, conf=floor, iou=iou_threshold, imgsz=normalize_imgsz(imgsz),
-            tracker=tracker_config, persist=True, agnostic_nms=agnostic_nms, verbose=False,
-        )
-    except Exception as error:
-        raise InferenceError(f"Tracking failed: {error}") from error
-
-    if not results:
-        return []
-
-    result = results[0]
-    boxes = result.boxes
-    if boxes is None or len(boxes) == 0:
-        return []
-
-    class_names = result.names
-    xywh = boxes.xywh.cpu().numpy()
-    confidences = boxes.conf.cpu().numpy()
-    class_indexes = boxes.cls.cpu().numpy().astype(int)
-    track_ids = boxes.id.int().cpu().tolist() if boxes.id is not None else [None] * len(xywh)
-
-    now = time.monotonic()
-    predictions: List[Dict[str, Any]] = []
-    for (cx, cy, width, height), confidence, class_index, track_id in zip(xywh, confidences, class_indexes, track_ids):
-        class_name = class_names.get(int(class_index), str(class_index)) if isinstance(class_names, dict) else str(class_index)
-        if classes and class_name not in classes:
-            continue
-        if float(confidence) < conf_threshold:
-            continue
-        prediction = {
-            "x": float(cx) + offset_x, "y": float(cy) + offset_y,
-            "width": float(width), "height": float(height),
-            "class": class_name, "confidence": float(confidence),
-        }
-        if track_id is not None:
-            prediction["track_id"] = f"{id_prefix}{int(track_id)}"
-        if not stabilizer.apply(prediction, frame.shape[1], frame.shape[0], now):
-            continue
-        predictions.append(prediction)
-
-    return predictions
-
-
 def release_models(*models: Any) -> None:
-    """Drop everything a model keeps alive (tracker state, predictor) and hand the memory back.
-
-    Called when a detection mode is stopped so an unused pipeline costs no RAM and no CPU. The caller
-    must also drop its own references (set them to None) for the memory to actually be reclaimed.
-    """
     for model in models:
         if model is None:
             continue
@@ -391,7 +238,7 @@ def release_models(*models: Any) -> None:
         except Exception:
             pass
     gc.collect()
-    try:  # glibc keeps freed native memory (NCNN/ONNX buffers) - return it to the OS
+    try:
         import ctypes
         ctypes.CDLL("libc.so.6").malloc_trim(0)
     except Exception:

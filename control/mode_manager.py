@@ -228,8 +228,7 @@ class ModeManager:
         with self._run_lock:
             old_mode, old_name = self._active, self._active_name
             self._active, self._active_name, self._since = new_mode, name, time.time()
-        self.ctx.live.clear()                      # old mode's boxes must not linger on screen
-        self._safe_stop(old_mode)                  # in the background: flush its tracks, free its models
+        self._safe_stop(old_mode)                  # in the background: free its models
         if persist and self.remember_last:
             self._save_state(name, source)
         log.info("[mode] %s stopped and released", old_name)

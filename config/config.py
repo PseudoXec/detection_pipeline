@@ -1,17 +1,4 @@
-"""The whole program's settings, assembled from the config files that live in each folder.
-
-    config/config.yaml           GLOBAL on/off switches and the mode toggle - nothing else
-    camera/config.yaml           camera + ROI polygon            api/config.yaml      command-center endpoints
-    live/config.yaml             live view                       storage/config.yaml  shared SQLite buffer
-    modes/vehicle/config.yaml    everything vehicle mode needs   modes/person/config.yaml   everything person mode needs
-
-Each of those has a `config.py` next to it with the typed settings. This file only combines them, so
-a setting is always found next to the code that uses it.
-
-`PipelineConfig.load(override_path)` accepts one optional extra yaml file that is applied last. Its top-level
-keys are the fields of PipelineConfig (camera, roi, api, live, storage, vehicle, person, mode, runtime,
-switches), e.g. a test config or a one-off experiment.
-"""
+"""The whole program's settings, assembled from the config files that live in each folder."""
 import socket
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -20,7 +7,6 @@ from typing import ClassVar, Dict, List, Optional
 from api.config import ApiConfig
 from camera.config import CameraConfig, RoiConfig
 from config.loader import PROJECT_ROOT, load_yaml_into
-from live.config import LiveConfig
 from modes.person.config import PersonConfig
 from modes.vehicle.config import VehicleConfig
 from storage.config import StorageConfig
@@ -30,15 +16,14 @@ CONFIG_DIR = Path(__file__).resolve().parent
 
 @dataclass
 class ModeConfig:
-    """Which detection pipeline runs, and how the command center switches it."""
+    """Which detection pipeline runs, and how it is configured."""
     PATH_FIELDS: ClassVar[Dict[str, str]] = {"state_file": "root"}
 
     default: str = "vehicle"                    # vehicle | person | idle - used when nothing was saved yet
     allowed: List[str] = field(default_factory=lambda: ["vehicle", "person", "idle"])
-    remember_last: bool = True                  # keep the command center's last choice across reboots
+    remember_last: bool = True                  # keep the last choice across reboots
     state_file: str = str(PROJECT_ROOT / "data" / "active_mode.json")
     preload_on_switch: bool = True              # load the new pipeline while the old one keeps running
-    control_enabled: bool = True                # POST/GET /control/mode on the live-server port
 
 
 @dataclass
@@ -57,8 +42,6 @@ class SwitchesConfig:
     """Global on/off switches."""
     api: bool = True                            # master switch: off = no ROI fetch, camera source fetch or sending (all modes)
     roi_fetch_from_api: bool = True
-    live_stream: bool = False
-    live_boxes: bool = False
     show_preview: bool = False
 
 
@@ -71,7 +54,6 @@ class PipelineConfig:
     camera: CameraConfig = field(default_factory=CameraConfig)
     roi: RoiConfig = field(default_factory=RoiConfig)
     api: ApiConfig = field(default_factory=ApiConfig)
-    live: LiveConfig = field(default_factory=LiveConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
 
     vehicle: VehicleConfig = field(default_factory=VehicleConfig)
@@ -85,7 +67,6 @@ class PipelineConfig:
             (CONFIG_DIR / "config.yaml", config),
             (PROJECT_ROOT / "camera" / "config.yaml", config),
             (PROJECT_ROOT / "api" / "config.yaml", config),
-            (PROJECT_ROOT / "live" / "config.yaml", config),
             (PROJECT_ROOT / "storage" / "config.yaml", config),
             (PROJECT_ROOT / "modes" / "vehicle" / "config.yaml", config.vehicle),
             (PROJECT_ROOT / "modes" / "person" / "config.yaml", config.person),
