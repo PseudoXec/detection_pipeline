@@ -15,6 +15,34 @@ log = logging.getLogger("pipeline")
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
+FIRST_FRAME_TIMEOUT_SECONDS = 20.0
+
+
+def adopt_stream_size(config: PipelineConfig, shape) -> bool:
+    """Make camera.frame_width/height equal to what the camera really sends.
+
+    The configured values are only a fallback for before the first frame arrives (and for image/folder
+    runs). Once a frame exists its own size is the truth: warm-up, the ROI crop window and the size
+    reported to the command center all read these two fields. Returns True when they changed."""
+    height, width = int(shape[0]), int(shape[1])
+    camera_cfg = config.camera
+    if (width, height) == (camera_cfg.frame_width, camera_cfg.frame_height):
+        return False
+    log.info("[camera] using the stream's own resolution %dx%d (camera.frame_width/height was %dx%d)",
+             width, height, camera_cfg.frame_width, camera_cfg.frame_height)
+    camera_cfg.frame_width, camera_cfg.frame_height = width, height
+    return True
+
+
+def wait_for_first_frame(camera: ThreadedRTSPCamera, timeout_seconds: float):
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        captured = camera.read_latest()
+        if captured is not None:
+            return captured
+        time.sleep(0.05)
+    return None
+
 
 def list_images_in_folder(folder: str) -> List[str]:
     files = []
@@ -39,8 +67,6 @@ def run_on_stream(manager, config: PipelineConfig, live_server, initial_mode: st
 
     camera = ThreadedRTSPCamera(
         rtsp_url=config.camera.rtsp_url,
-        frame_width=config.camera.frame_width,
-        frame_height=config.camera.frame_height,
         buffer_size=config.camera.capture_buffer_size,
         reconnect_delay_seconds=config.camera.reconnect_delay_seconds,
         max_reconnect_attempts=config.camera.max_reconnect_attempts,
@@ -51,6 +77,15 @@ def run_on_stream(manager, config: PipelineConfig, live_server, initial_mode: st
         live_server.set_frame_source(camera.read_latest)
         live_server.start()
 
+    # Learn the real resolution BEFORE the models are warmed up and the ROI crop window is computed,
+    # so both are built for the frames that will actually arrive.
+    first_frame = wait_for_first_frame(camera, FIRST_FRAME_TIMEOUT_SECONDS)
+    if first_frame is not None:
+        adopt_stream_size(config, first_frame.image.shape[:2])
+    else:
+        log.warning("[camera] no frame within %.0fs - warming up with camera.frame_width/height (%dx%d) "
+                    "and switching to the stream's real size as soon as a frame arrives",
+                    FIRST_FRAME_TIMEOUT_SECONDS, config.camera.frame_width, config.camera.frame_height)
     manager.start(initial_mode, frame_shape=(config.camera.frame_height, config.camera.frame_width))
 
     stop_event = threading.Event()
@@ -94,6 +129,7 @@ def run_on_stream(manager, config: PipelineConfig, live_server, initial_mode: st
                 time.sleep(0.01)
                 continue
             last_processed_frame_number = captured.frame_number
+            adopt_stream_size(config, captured.image.shape[:2])   # follows a camera profile change too
 
             manager.process_frame(captured.image, captured_at=captured.captured_at)
             frames_processed += 1

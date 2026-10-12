@@ -122,3 +122,10 @@ Live snapshots now also carry a `"mode"` field (the list is still called `vehicl
 | Time | `DetectedAt` is ISO 8601 **with the Pi's UTC offset** (the first draft labelled local time as UTC) |
 | Camera password | Removed from `camera_source` before it is stored in `person_detections` or sent (`core/urls.py`). The vehicle table still stores the stream address as before |
 | Retries | Person events are never given up on: a failing event waits longer each time (up to an hour) instead of being dropped after 5 tries, one bad event no longer blocks the ones behind it, and only 400/413/415/422 park an event (a wrong URL or token is retried) |
+
+## Entering-vehicle box size + stream resolution pass
+
+| Area | Change | Files |
+|---|---|---|
+| Box size on entry | The tracker's Kalman filter barely updates a track's width/height ratio (ultralytics hard-codes its noise), so a track whose first detection was off - partly in view, loose low-confidence box - kept a wrong-width box for 15+ frames before it slowly resized. After every update the ratio now moves 60% of the way to the detection (`KALMAN_ASPECT_FOLLOW`), settling in 2-3 updates. Position/height tracking is unchanged. Set it to `None` to restore stock behaviour | `core/detector.py` |
+| Frame width/height | The stream's real resolution (read from the first decoded frame, e.g. "stream resolution confirmed: 1280x720") is now what warm-up, the ROI crop window and `/device` use; `camera.frame_width/height` in the yaml is only a fallback until that frame arrives. A camera profile change after a reconnect is followed automatically. The `CAP_PROP_FRAME_WIDTH/HEIGHT` calls are gone (they are ignored for RTSP under FFmpeg) | `camera/frame_loop.py`, `camera/camera.py`, `camera/config.yaml` |

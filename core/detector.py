@@ -35,10 +35,22 @@ MAX_FRAME_FRACTION = 0.80   # a box wider/taller than this share of the frame is
 # (stock is 1/160). Set to None to leave ultralytics untouched.
 KALMAN_VELOCITY_WEIGHT: Optional[float] = 1.0 / 25
 
+# The reported box comes from ByteTrack's Kalman state (x, y, aspect ratio, height). Ultralytics hard-codes
+# a very small noise for the ASPECT RATIO (process 1e-2, measurement 1e-1), so the filter barely believes
+# new detections about a vehicle's width/height ratio: if a track's first detection is off (a vehicle
+# only partly in view, a loose low-confidence box) the box keeps that wrong width for 15+ frames even
+# though every following detection is right - the vehicle "enters" with a wrong-sized box that only
+# slowly resizes. After each update the aspect ratio is moved this share of the way to the detection
+# (0 = stock behaviour, 1 = take the detection's ratio as is; 0.6 settles in ~3 updates).
+KALMAN_ASPECT_FOLLOW: Optional[float] = 0.6
 
-def tune_tracker_kalman(velocity_weight: Optional[float] = KALMAN_VELOCITY_WEIGHT) -> bool:
+
+def tune_tracker_kalman(
+    velocity_weight: Optional[float] = KALMAN_VELOCITY_WEIGHT,
+    aspect_follow: Optional[float] = KALMAN_ASPECT_FOLLOW,
+) -> bool:
     """Make ByteTrack follow the detector more closely. Safe no-op if ultralytics' internals differ."""
-    if not velocity_weight:
+    if not velocity_weight and not aspect_follow:
         return False
     try:
         from ultralytics.trackers import byte_tracker
@@ -47,17 +59,30 @@ def tune_tracker_kalman(velocity_weight: Optional[float] = KALMAN_VELOCITY_WEIGH
         if getattr(filter_cls, "_lag_tuned", False):
             return True
 
-        original_init = filter_cls.__init__
+        if velocity_weight:
+            original_init = filter_cls.__init__
 
-        def tuned_init(self, *args, **kwargs):
-            original_init(self, *args, **kwargs)
-            self._std_weight_velocity = velocity_weight
+            def tuned_init(self, *args, **kwargs):
+                original_init(self, *args, **kwargs)
+                self._std_weight_velocity = velocity_weight
 
-        filter_cls.__init__ = tuned_init
+            filter_cls.__init__ = tuned_init
+            shared = getattr(byte_tracker.STrack, "shared_kalman", None)  # already built at import time
+            if shared is not None:
+                shared._std_weight_velocity = velocity_weight
+
+        if aspect_follow:
+            original_update = filter_cls.update
+
+            def tuned_update(self, mean, covariance, measurement, *args, **kwargs):
+                # *args/**kwargs: newer ultralytics versions pass an extra `confidence` argument
+                new_mean, new_covariance = original_update(self, mean, covariance, measurement, *args, **kwargs)
+                new_mean[2] += aspect_follow * (measurement[2] - new_mean[2])
+                return new_mean, new_covariance
+
+            filter_cls.update = tuned_update
+
         filter_cls._lag_tuned = True
-        shared = getattr(byte_tracker.STrack, "shared_kalman", None)  # already built at import time
-        if shared is not None:
-            shared._std_weight_velocity = velocity_weight
         return True
     except Exception as error:  # different ultralytics version - keep stock behaviour
         log.warning("[detector] could not tune the tracker's Kalman filter (%s) - using stock ByteTrack", error)

@@ -28,8 +28,8 @@ class ThreadedRTSPCamera:
     def __init__(
         self,
         rtsp_url: str,
-        frame_width: int = 1280,
-        frame_height: int = 720,
+        frame_width: Optional[int] = None,
+        frame_height: Optional[int] = None,
         buffer_size: int = 1,
         reconnect_delay_seconds: float = 5.0,
         max_reconnect_attempts: int = 0,
@@ -37,8 +37,12 @@ class ThreadedRTSPCamera:
     ):
         self.rtsp_url = rtsp_url
         self.max_fps = max_fps
+        # Only a fallback: the camera decides the resolution, never this program. The real size is
+        # read from the first decoded frame of every (re)connect and published as actual_width/height.
         self.frame_width = frame_width
         self.frame_height = frame_height
+        self.actual_width: Optional[int] = None
+        self.actual_height: Optional[int] = None
         self.buffer_size = buffer_size
         self.reconnect_delay_seconds = reconnect_delay_seconds
         self.max_reconnect_attempts = max_reconnect_attempts
@@ -66,8 +70,8 @@ class ThreadedRTSPCamera:
 
     def _open_capture(self) -> None:
         capture = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
-        capture.set(cv2.CAP_PROP_FRAME_WIDTH, self.frame_width)
-        capture.set(cv2.CAP_PROP_FRAME_HEIGHT, self.frame_height)
+        # No CAP_PROP_FRAME_WIDTH/HEIGHT here: they are ignored for RTSP under the FFmpeg backend, so
+        # they only pretended the size was configurable. The stream's own size is used instead.
         capture.set(cv2.CAP_PROP_BUFFERSIZE, self.buffer_size)
         capture.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 8000)
         capture.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 8000)
@@ -115,21 +119,20 @@ class ThreadedRTSPCamera:
                 )
 
     def _check_actual_resolution(self, frame: np.ndarray) -> None:
-        """cv2.VideoCapture.set(CAP_PROP_FRAME_WIDTH/HEIGHT) is a no-op for RTSP sources under the
-        FFmpeg backend - the camera decides the resolution, not this config. Log what actually came
-        back so a `camera.frame_width/height` that no longer matches the stream (a lower-quality
-        profile, a changed camera setting) shows up immediately instead of silently degrading
-        detection and the images that get stored."""
+        """Record the resolution the camera really sends (the first frame after each (re)connect).
+        Everything downstream (warm-up, the ROI crop window, the size reported to the command
+        center) follows this, not the configured camera.frame_width/height."""
         actual_h, actual_w = frame.shape[:2]
-        if (actual_w, actual_h) != (self.frame_width, self.frame_height):
-            log.warning(
-                "[camera] stream is actually %dx%d but config.yaml says camera.frame_width/height is "
-                "%dx%d - update the config to match (this mismatch can also mean the camera is now "
-                "sending a lower-resolution/quality profile than before)",
-                actual_w, actual_h, self.frame_width, self.frame_height,
-            )
-        else:
+        previous = (self.actual_width, self.actual_height)
+        self.actual_width, self.actual_height = actual_w, actual_h
+        if previous == (None, None):
             log.info("[camera] stream resolution confirmed: %dx%d", actual_w, actual_h)
+        elif previous != (actual_w, actual_h):
+            log.warning(
+                "[camera] stream resolution changed from %dx%d to %dx%d after a reconnect "
+                "(the camera switched profile) - following the new size",
+                previous[0], previous[1], actual_w, actual_h,
+            )
 
     def _reconnect(self) -> None:
         if self._capture is not None:
