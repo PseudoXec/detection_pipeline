@@ -35,8 +35,8 @@ switches:
 # Process-wide
 runtime:
   log_level: "INFO"
-  opencv_threads: 2
+  opencv_threads: 4
   max_frames: 0 # 0 = run forever
   device_id: null # stamped on person events; null = this machine's hostname
   device: null # model device, null = auto
-  inference_threads: 2 # ONNX Runtime CPU threads: 0 = auto, -1 = no limit
+  inference_threads: 4 # ONNX Runtime CPU threads: 0 = auto, -1 = no limit

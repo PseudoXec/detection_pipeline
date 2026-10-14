@@ -7,8 +7,8 @@ model:
   plate_weights: "models/platenum_closeup.onnx"
   vehicle_imgsz: [512, 896] # [height, width] - must match vehicle.onnx's static shape
   plate_imgsz: 640 # must match platenum_closeup.onnx's static shape
-  vehicle_conf_threshold: 0.40
-  plate_conf_threshold: 0.35
+  vehicle_conf_threshold: 0.50
+  plate_conf_threshold: 0.50
   vehicle_classes: null # e.g. "car,truck,bus,motorcycle"; null = accept all
   agnostic_nms: true # one box per vehicle even when the model flips between classes
 
@@ -17,8 +17,8 @@ roi: # what counts as inside the zone (the polygon itself is in camera/config.ya
 
 tracking:
   bytetrack_config: "bytetrack.yaml"
-  dedup_cooldown_seconds: 2.0
-  detector_conf_floor: 0.20 # low-conf boxes are loose/oversized; 0.2 still keeps tracks alive
+  dedup_cooldown_seconds: 30
+  detector_conf_floor: 0.3 # low-conf boxes are loose/oversized; 0.2 still keeps tracks alive
   max_plate_attempts: 4
   plate_retry_interval_seconds: 0.4
   plate_stale_finalize_seconds: 1.5
