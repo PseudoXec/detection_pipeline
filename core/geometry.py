@@ -1,11 +1,11 @@
 import logging
-import math
 from typing import Any, Dict, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
 
 log = logging.getLogger("pipeline")
+
 
 def box_edges(box: Dict[str, Any]) -> Tuple[float, float, float, float]:
     left = box["x"] - box["width"] / 2
@@ -15,38 +15,16 @@ def box_edges(box: Dict[str, Any]) -> Tuple[float, float, float, float]:
     return left, top, right, bottom
 
 
-def compute_iou(box_a: Dict[str, Any], box_b: Dict[str, Any]) -> float:
-    ax1, ay1, ax2, ay2 = box_edges(box_a)
-    bx1, by1, bx2, by2 = box_edges(box_b)
-
-    overlap_w = max(0.0, min(ax2, bx2) - max(ax1, bx1))
-    overlap_h = max(0.0, min(ay2, by2) - max(ay1, by1))
-    intersection = overlap_w * overlap_h
-
-    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
-    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
-    union = area_a + area_b - intersection
-
-    return intersection / union if union else 0.0
-
-
-def center_distance_in_widths(box_a: Dict[str, Any], box_b: Dict[str, Any]) -> float:
-    pixel_distance = math.hypot(box_a["x"] - box_b["x"], box_a["y"] - box_b["y"])
-    scale = max(box_a.get("width", 0), box_a.get("height", 0),
-                box_b.get("width", 0), box_b.get("height", 0), 1.0)
-    return pixel_distance / scale
-
-
 def crop_box(
     frame: np.ndarray,
-    vehicle_box: Dict[str, Any],
+    box: Dict[str, Any],
     padding_ratio: float = 0.08,
     min_crop_height: int = 0,
 ) -> Optional[np.ndarray]:
     frame_h, frame_w = frame.shape[:2]
 
-    cx, cy = vehicle_box.get("x"), vehicle_box.get("y")
-    bw, bh = vehicle_box.get("width"), vehicle_box.get("height")
+    cx, cy = box.get("x"), box.get("y")
+    bw, bh = box.get("width"), box.get("height")
     if None in (cx, cy, bw, bh):
         return None
 
@@ -68,7 +46,6 @@ def crop_box(
         crop = cv2.resize(crop, (int(crop_w * scale), min_crop_height), interpolation=cv2.INTER_CUBIC)
 
     return crop
-
 
 
 def point_in_polygon(x: float, y: float, polygon: Sequence[Sequence[float]]) -> bool:

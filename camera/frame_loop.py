@@ -62,7 +62,7 @@ def run_on_images(manager, image_paths: list) -> None:
         log.info("%s -> %d new detection(s)", path, new_detections)
 
 
-def run_on_stream(manager, config: PipelineConfig, live_server, initial_mode: str) -> None:
+def run_on_stream(manager, config: PipelineConfig, initial_mode: str) -> None:
     configure_decode_threads(config.camera.decode_threads)
 
     camera = ThreadedRTSPCamera(
@@ -72,10 +72,6 @@ def run_on_stream(manager, config: PipelineConfig, live_server, initial_mode: st
         max_reconnect_attempts=config.camera.max_reconnect_attempts,
         max_fps=config.camera.max_fps,
     ).start()
-
-    if live_server is not None:
-        live_server.set_frame_source(camera.read_latest)
-        live_server.start()
 
     # Learn the real resolution BEFORE the models are warmed up and the ROI crop window is computed,
     # so both are built for the frames that will actually arrive.

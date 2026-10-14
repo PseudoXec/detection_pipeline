@@ -1,41 +1,37 @@
-"""Entry point: reads the settings, starts the services every detection mode shares, then feeds frames
-to the mode manager. Everything with a real job lives in its own folder - this file only wires them up.
+"""Entry point for lean vehicle and person detection pipeline on Raspberry Pi:
 
-    python run.py                       run from the camera, in the mode the command center last chose
-    python run.py --mode person         start in a specific mode
-    python run.py --image a.jpg         one image          python run.py --folder ./imgs    a folder of images
+    python run.py                   run from the camera in the default/saved mode
+    python run.py --mode vehicle    run vehicle detection flow
+    python run.py --mode person     run person detection flow
+    python run.py --image a.jpg     run on a single image
+    python run.py --folder ./imgs   run on a folder of images
 """
 import argparse
 import logging
-import os
-import signal
 import sys
-import threading
 import uuid
 
 import cv2
 
+from api.sender import ApiSender
 from camera.frame_loop import list_images_in_folder, run_on_images, run_on_stream
 from camera.resolve import resolve_camera_info, resolve_camera_source
 from camera.roi_manager import RoiManager
 from config.config import PipelineConfig
-from control.device import RESTART_EXIT_CODE, DeviceService
 from control.mode_manager import ModeManager, choose_initial_mode
-from live.outputs import build_live_outputs
-from live.sinks import LiveSinks
 from modes.base import RuntimeContext
-from storage.hub import StorageHub
+from storage.buffer import SQLiteBuffer
 
 log = logging.getLogger("pipeline")
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Detection pipeline (vehicle / person), switchable from the command center")
-    parser.add_argument("--config", help="Optional extra config file, applied after all the config.yaml files (see config/config.py)")
+    parser = argparse.ArgumentParser(description="Lean detection pipeline (vehicle / person)")
+    parser.add_argument("--config", help="Optional extra config file, applied after all the config.yaml files")
     parser.add_argument("--rtsp-url", help="Override camera.rtsp_url")
     parser.add_argument("--image", help="Process a single image instead of a live stream")
     parser.add_argument("--folder", help="Process every image in a folder instead of a live stream")
-    parser.add_argument("--mode", help="Start in this detection mode (vehicle | person | idle), overriding the saved choice and mode.default")
+    parser.add_argument("--mode", help="Start in this detection mode (vehicle | person | idle)")
     return parser.parse_args()
 
 
@@ -72,28 +68,27 @@ def main() -> None:
     camera_source = config.camera.rtsp_url or config.camera.folder or config.camera.image or "unknown"
     initial_mode = choose_initial_mode(config, args.mode)
 
-    # ---- everything below is SHARED by all detection modes and lives for the whole run -----------
-    stores = StorageHub(config, camera_info).start()
+    # Shared services for the detection flows
+    api_sender = ApiSender(config.api, camera_info)
+    buffer = SQLiteBuffer(config, camera_info, api_sender).start()
     roi = RoiManager(config)
     roi.start_polling()
-    sinks = LiveSinks()
+
     ctx = RuntimeContext(
-        config=config, camera_source=camera_source, camera_info=camera_info,
-        stores=stores, roi=roi, live=sinks, session_id=uuid.uuid4().hex,
+        config=config,
+        camera_source=camera_source,
+        camera_info=camera_info,
+        buffer=buffer,
+        roi=roi,
+        session_id=uuid.uuid4().hex,
     )
     manager = ModeManager(
-        ctx, allowed=config.mode.allowed, state_file=config.mode.state_file,
-        remember_last=config.mode.remember_last, preload_on_switch=config.mode.preload_on_switch,
+        ctx,
+        allowed=config.mode.allowed,
+        state_file=config.mode.state_file,
+        remember_last=config.mode.remember_last,
+        preload_on_switch=config.mode.preload_on_switch,
     )
-    restart_requested = threading.Event()
-
-    def request_restart() -> None:
-        """Command center asked for a restart: stop gracefully (buffer flushed), then exit non-zero so systemd restarts us."""
-        restart_requested.set()
-        os.kill(os.getpid(), signal.SIGTERM)
-
-    device = DeviceService(ctx, manager, request_restart)
-    publisher, server = build_live_outputs(config, roi, manager, sinks, device)
 
     try:
         if config.camera.folder:
@@ -106,22 +101,14 @@ def main() -> None:
             manager.start(initial_mode)
             run_on_images(manager, [config.camera.image])
         elif config.camera.rtsp_url:
-            run_on_stream(manager, config, server, initial_mode)
+            run_on_stream(manager, config, initial_mode)
         else:
             sys.exit("No source configured - set camera.rtsp_url, camera.image, or camera.folder (camera/config.yaml)")
     finally:
-        manager.stop()                     # flushes the active mode's in-flight tracks into the stores
-        if publisher is not None:
-            publisher.stop()
-        if server is not None:
-            server.stop()
+        manager.stop()
         roi.stop()
         log.info("flushing storage buffer before exit...")
-        stores.stop()
-
-    if restart_requested.is_set():
-        log.warning("exiting with code %d so the service manager restarts the pipeline", RESTART_EXIT_CODE)
-        sys.exit(RESTART_EXIT_CODE)
+        buffer.stop()
 
 
 if __name__ == "__main__":

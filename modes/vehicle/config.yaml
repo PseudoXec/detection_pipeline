@@ -15,6 +15,7 @@ model:
 roi: # what counts as inside the zone (the polygon itself is in camera/config.yaml)
   crop_margin: 0.05
 
+<<<<<<< HEAD
 tracking:
   bytetrack_config: "bytetrack.yaml"
   dedup_cooldown_seconds: 30
@@ -25,13 +26,14 @@ tracking:
   track_ttl_seconds: 30
   plate_worker_max_queue: 12 # background plate-detection queue depth
 
+=======
+>>>>>>> f8a0d65d90cb5dfab3246567fe31f8616d2eb944
 crop:
+  vehicle_padding_ratio: 0.08
+  vehicle_min_crop_height: 200
   plate_min_crop_height: 160
   plate_padding_pixels: 4
   plate_padding_ratio: 0.12
-
-preprocess:
-  plate_crop_min_height: 64
 
 images:
   jpeg_quality: 90
@@ -40,33 +42,8 @@ images:
 features:
   roi_filter: true
   roi_crop_detect: true
-  fallback_tracker: true
-  position_dedup: true
   plate_detection: true
-  async_plate_detection: true # run the plate model off the frame-reading thread (see plate_worker.py)
-  enhance_before_plate_detect: true
-  enhance_plate_crop: true
   save_images_to_disk: true
-
-  time_vehicle_detect: true
-  time_vehicle_crop: true
-  time_plate_detect: true
-  time_plate_crop: true
-
   print_console: true
-  print_timing: true
-
-  store_to_sqlite: true
-
   send_via_api: true # needs api.vehicle_endpoint_url and switches.api
   delete_row_after_api_send: true
-
-  col_vehicle_image: true
-  col_vehicle_box: true
-  col_plate_image: true
-  col_plate_box: true
-  col_vehicle_detect_ms: true
-  col_vehicle_crop_ms: true
-  col_plate_detect_ms: true
-  col_plate_crop_ms: true
-  col_total_pipeline_ms: true
